@@ -2678,6 +2678,14 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._wait_state_update(timeout=3.0)
         return ok
 
+    async def async_play_sound(self, audio_id: int) -> bool:
+        """Play a built-in voice prompt on the mower by AudioId (PbInput.audioId) — the
+        locate / find-my-mower trigger. Fire-and-forget: the mower plays the prompt but does
+        NOT echo a commanded id back in telemetry, so there's no state feedback (confirmed live
+        2026-06-22). Shared by the Play Sound select + the lymow.play_sound service."""
+        from .protocol import encode_play_audio
+        return bool(self._publish(encode_play_audio(int(audio_id))))
+
     async def async_set_dock_on_error(self, enabled: bool) -> bool:
         """Set whether the mower returns to dock on error."""
         from .protocol import encode_set_dock_on_error
