@@ -1069,7 +1069,7 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)] + [LymowZoneHistorySensor(coord)] + [LymowCurrentChannelSensor(coord)] + [LymowOverdueZonesSensor(coord)],
+        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)] + [LymowZoneHistorySensor(coord)] + [LymowCurrentChannelSensor(coord)] + [LymowOverdueZonesSensor(coord)] + [LymowLocationStateSensor(coord)],
         update_before_add=False,
     )
 
@@ -1275,6 +1275,46 @@ class LymowZonePerZoneSensor(_ZoneSubDeviceEntity, SensorEntity, RestoreEntity):
                               "CLOUD SESSION TOTALS (all zones): mowing_minutes, session_area_m2; "
                               "zone_area_m2 = the zone's geometric size.")
         return out
+
+
+class LymowLocationStateSensor(LymowEntity, SensorEntity):
+    """Where the mower is, as ONE authoritative state — the turnkey geofence signal.
+
+    Resolved locally (No-Go > Zone > Channel > Off-Map, debounced) so it never disagrees
+    with Current Zone / Current Channel. States:
+      Docked · Zone: <name> · Channel: <label> · No Go: <name> · Off-Map.
+    'No Go: …' and 'Off-Map' are geofence breaches — automate on `is_breach` (or the state)
+    to alarm/notify/track. 'Off-Map' means the mower is outside EVERY known zone and channel
+    while active (negative-space whole-property geofence)."""
+
+    _attr_icon = "mdi:map-marker-radius"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "location_state")
+        self._attr_name = "Location State"
+
+    @property
+    def native_value(self):
+        return (self.coordinator.data or {}).get("locationState")
+
+    @property
+    def extra_state_attributes(self):
+        st = (self.coordinator.data or {}).get("locationState") or ""
+        no_go = st.startswith("No Go")
+        off_map = st == "Off-Map"
+        return {
+            "description": ("Authoritative location of the mower (No-Go > Zone > Channel > "
+                            "Off-Map, debounced). 'No Go: …' or 'Off-Map' = geofence breach. "
+                            "Off-Map = outside every known zone AND channel while active."),
+            "zone": (self.coordinator.data or {}).get("currentZone"),
+            "channel": (self.coordinator.data or {}).get("currentChannel"),
+            "is_breach": no_go or off_map,
+            # String mirror of is_breach for dashboard conditional cards — a tile conditional
+            # can't reliably match a boolean attribute, but matches a string cleanly. [Nate]
+            "geofence_status": "breach" if (no_go or off_map) else "ok",
+            "off_map": off_map,
+            "in_no_go": no_go,
+        }
 
 
 class LymowOverdueZonesSensor(LymowEntity, SensorEntity):
