@@ -41,6 +41,7 @@ from .const import (
     F_RTK_STATUS,
     F_SERIAL_NO,
     F_WIFI_SIGNAL,
+    MANUFACTURER,
     NET_SIM_SIGNAL,
     NET_WIFI_SIGNAL,
     RTK_STATUS_LABELS,
@@ -1192,7 +1193,24 @@ class LymowSensor(LymowEntity, SensorEntity):
         return attrs or None
 
 
-class LymowZonePerZoneSensor(LymowEntity, SensorEntity, RestoreEntity):
+class _ZoneSubDeviceEntity(LymowEntity):
+    """Mixin: place an entity under a dedicated '<name> Zones' sub-device that hangs
+    off the main mower (via_device). Yards with dozens of zones generate dozens of
+    per-zone entities; grouping them into their own collapsible device card keeps the
+    main device page from becoming an endless scroll."""
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, f"{self.coordinator.thing_name}_zones")},
+            "name": f"{self._device_name} Zones",
+            "manufacturer": MANUFACTURER,
+            "model": "Zone History",
+            "via_device": (DOMAIN, self.coordinator.thing_name),
+        }
+
+
+class LymowZonePerZoneSensor(_ZoneSubDeviceEntity, SensorEntity, RestoreEntity):
     """One sensor PER zone — state is the last-mowed timestamp, attributes carry that
     zone's unified history record (mow_count, mowing_minutes, derived per-zone mow time,
     session_minutes, battery_used, coverage, areas). hashId-anchored so an app rename keeps
