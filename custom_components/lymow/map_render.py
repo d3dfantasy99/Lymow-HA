@@ -404,11 +404,11 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
 
     if not drawable:
         draw_text(draw, "No drawable polygons in state", 20, 100, 18, RED)
-        return img.convert("RGB"), dbg
+        return png_bytes(img.convert("RGB")), dbg
 
     if not all_pts:
         draw_text(draw, "Drawable zones exist but points failed to parse", 20, 100, 18, RED)
-        return img.convert("RGB"), dbg
+        return png_bytes(img.convert("RGB")), dbg
 
     dbg.update({"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y,
                 "canvas_w": W, "canvas_h": H})
@@ -1119,7 +1119,7 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             draw_text(draw, _lab, _tx, _yy - 7, 12, WHITE)
         _cx += _colws[_c]
 
-    return img.convert("RGB"), dbg
+    return png_bytes(img.convert("RGB")), dbg
 
 
 def text_png(title: str, subtitle: str) -> bytes:

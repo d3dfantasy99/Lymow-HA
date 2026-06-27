@@ -252,7 +252,7 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return LymowOptionsFlow(entry)
 
 
-class LymowOptionsFlow(config_entries.OptionsFlow):
+class LymowOptionsFlow(config_entries.OptionsFlowWithReload):
     def __init__(self, entry: config_entries.ConfigEntry) -> None:
         self._entry = entry
 
@@ -267,6 +267,10 @@ class LymowOptionsFlow(config_entries.OptionsFlow):
                     "scan_interval",
                     default=self._entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL),
                 ): vol.All(int, vol.Range(min=10, max=300)),
+                vol.Required(
+                    "render_multiprocessing",
+                    default=self._entry.options.get("render_multiprocessing", True),
+                ): bool,
             }),
         )
 
