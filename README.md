@@ -267,6 +267,31 @@ entities:
 
 ---
 
+## Example automations
+
+### Alert if the mower leaves its mapped area
+
+The **Location State** sensor (`sensor.lymow_<<mowername>>_location_state`) reads `Docked`,
+`Zone: <name>`, `Channel: <label>`, `No Go: <name>`, or `Off-Map`. `No Go:` and `Off-Map` are
+geofence breaches (also exposed via the `is_breach` attribute), so you can notify or alarm the
+moment the mower goes where it shouldn't:
+
+```yaml
+automation:
+  - alias: "Lymow left its mapped area"
+    trigger:
+      - platform: state
+        entity_id: sensor.lymow_<<mowername>>_location_state
+        to: "Off-Map"
+        for: "00:00:30"            # debounce brief GPS wobble
+    action:
+      - service: notify.notify
+        data:
+          message: "⚠️ Lymow is outside its mapped area (possible theft, or stuck off-map)."
+```
+
+---
+
 ## Troubleshooting
 
 ### Enable debug logging
