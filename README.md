@@ -290,6 +290,32 @@ automation:
           message: "⚠️ Lymow is outside its mapped area (possible theft, or stuck off-map)."
 ```
 
+### Sound the theft alarm if it leaves the yard
+
+Combine the Location State sensor with the mower's built-in audio — play its **Theft Alarm**
+clip when it goes Off-Map:
+
+```yaml
+automation:
+  - alias: "Lymow theft alarm"
+    trigger:
+      - platform: state
+        entity_id: sensor.lymow_<<mowername>>_location_state
+        to: "Off-Map"
+        for: "00:00:30"
+    action:
+      - service: lymow.play_sound
+        data:
+          audio_id: 31              # 31 = Theft Alarm
+```
+
+### Playing sounds
+
+Use the **Play Sound** select (pick a clip; it auto-resets to `None`) or call the
+`lymow.play_sound` service with `audio_id` — these are the mower's own **built-in audio
+clips** (e.g. `30` Stop Button Pressed, `31` Theft Alarm, `32` Cutting Started), not custom
+tones. Fire-and-forget: the mower has no audio feedback, so the select snaps back after firing.
+
 ---
 
 ## Troubleshooting
