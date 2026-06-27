@@ -488,8 +488,13 @@ RTSP_PATH = "h264ESVideoTest"
 # Still user-tunable via the Channel Detection Buffer number for extra GPS slack if needed.
 DEFAULT_CHANNEL_BUFFER_M = 0.0
 
+# "Mow this often" (days) — drives the mow-age colour ramp + the Overdue Zones sensor (#2).
+DEFAULT_MOW_INTERVAL_DAYS = 7.0
+
 # Coverage map render styles (UI preference, persisted via sticky_device_info).
-COVERAGE_STYLE_OPTIONS = ["Gradient", "Logical Passes", "Green Checker", "Activity", "Paths Off"]
+# "Zone Age" tints each zone green by how long since its last completed mow (darker =
+# older), with the age folded into the zone label — an at-a-glance "what's overdue" view.
+COVERAGE_STYLE_OPTIONS = ["Gradient", "Logical Passes", "Green Checker", "Activity", "Zone Age", "Paths Off"]
 COVERAGE_STYLE_DEFAULT = "Green Checker"
 
 # Map name labels (UI preference, persisted via sticky_device_info). Controls which
