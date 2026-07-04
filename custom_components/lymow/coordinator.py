@@ -93,6 +93,7 @@ from .protocol import (
     encode_userctrl,
     encode_set_rr_config,
     encode_set_headlights,
+    encode_set_vehicle_led,
 
     encode_remote_control,
     encode_remote_stop,
@@ -2478,7 +2479,22 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._wait_state_update(timeout=3.0)
 
         return ok
-    
+
+    async def async_set_vehicle_led(self, enabled: bool) -> bool:
+        """Turn the vehicle LEDs (top indicators + LCD backlight) on or off."""
+        await self.auth.ensure_valid(self._email, self._password)
+
+        raw = encode_set_vehicle_led(enabled)
+
+        ok = self._publish(raw)
+        await self._wait_state_update()
+
+        # Ask for robot config again, so vehLedStatus updates quickly.
+        self._publish(encode_query_robot_config())
+        await self._wait_state_update(timeout=3.0)
+
+        return ok
+
     async def _send_rr_update(
         self,
         *,

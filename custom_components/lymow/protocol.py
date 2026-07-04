@@ -616,6 +616,8 @@ def encode_set_rr_config(
 # SocSignal — real-time commands carried on PbRobotConfig.signal (field 8).
 SIGNAL_TURN_ON_CAMERA_LIGHT  = 6
 SIGNAL_TURN_OFF_CAMERA_LIGHT = 7
+SIGNAL_TURN_ON_VEHICLE_LIGHT  = 10
+SIGNAL_TURN_OFF_VEHICLE_LIGHT = 11
 
 
 def encode_set_headlights(enabled: bool) -> bytes:
@@ -634,6 +636,29 @@ def encode_set_headlights(enabled: bool) -> bytes:
     msg.version = PB_VERSION_4_9
     msg.robotConfig.signal = (
         SIGNAL_TURN_ON_CAMERA_LIGHT if enabled else SIGNAL_TURN_OFF_CAMERA_LIGHT
+    )
+    return msg.SerializeToString()
+
+
+def encode_set_vehicle_led(enabled: bool) -> bytes:
+    """Turn the vehicle LEDs on or off.
+
+    The vehicle LEDs are the indicator LEDs on top of the mower plus the LCD
+    backlight — distinct from the headlight/camera LED. Matches the app's
+    RobotCommands.switchVehicleLed(): a real-time SocSignal on PbRobotConfig.signal
+    (field 8) — SIGNAL_TURN_ON_VEHICLE_LIGHT (10) / SIGNAL_TURN_OFF_VEHICLE_LIGHT
+    (11) — with an otherwise-empty robotConfig. Same cloud transport as the
+    headlight command.
+
+    State reads back from vehLedStatus (3=on, 4=off), same encoding as camLedStatus.
+    Unlike the camera LED, the firmware does NOT auto-manage the vehicle LEDs on
+    dock/charge — they hold whatever they were last set to, so an HA automation is
+    the intended way to turn them off while docked.
+    """
+    msg = pb.PbInput()
+    msg.version = PB_VERSION_4_9
+    msg.robotConfig.signal = (
+        SIGNAL_TURN_ON_VEHICLE_LIGHT if enabled else SIGNAL_TURN_OFF_VEHICLE_LIGHT
     )
     return msg.SerializeToString()
 
