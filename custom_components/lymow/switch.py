@@ -289,6 +289,67 @@ class LymowHeadlightsSwitch(LymowEntity, SwitchEntity):
         }
 
 
+class LymowVehicleLedSwitch(LymowEntity, SwitchEntity):
+    """Vehicle LEDs — the indicator LEDs on top of the mower plus the LCD backlight.
+
+    Distinct from the headlight/camera LED. Unlike the camera LED, the firmware does
+    NOT auto-off these on dock/charge, so they stay lit at night unless turned off —
+    which makes an HA automation (off while docked, on while off-dock) useful.
+    """
+
+    _attr_name = "Vehicle LEDs"
+    _attr_icon = "mdi:led-on"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "vehicle_led")
+
+    @property
+    def is_on(self) -> bool | None:
+        d = self.coordinator.data or {}
+
+        veh = d.get("vehLedStatus")
+
+        if veh is None:
+            rc = d.get("robotConfig")
+            if isinstance(rc, dict):
+                veh = rc.get("vehLedStatus")
+            elif rc is not None:
+                veh = getattr(rc, "vehLedStatus", None)
+
+        if veh is None:
+            return None
+
+        # Verified against the cloud shadow:
+        # vehLedStatus = 3 -> ON
+        # vehLedStatus = 4 -> OFF   (same encoding as camLedStatus)
+        return int(veh) == 3
+
+    @property
+    def available(self) -> bool:
+        d = self.coordinator.data or {}
+        return super().available and (
+            d.get("vehLedStatus") is not None
+            or d.get("robotConfig") is not None
+        )
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self.coordinator.async_set_vehicle_led(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self.coordinator.async_set_vehicle_led(False)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        d = self.coordinator.data or {}
+        return {
+            "veh_led_status": d.get("vehLedStatus"),
+            "state_mapping": {
+                "3": "on",
+                "4": "off",
+            },
+        }
+
+
 class LymowDockOnErrorSwitch(LymowEntity, SwitchEntity):
     """Switch to control whether mower returns to dock on error."""
 
