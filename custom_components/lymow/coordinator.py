@@ -1982,7 +1982,20 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         try:
             _LOGGER.info("Refreshing AWS credentials for %s", self.thing_name)
-            await self.auth.ensure_valid(self._email, self._password)
+            try:
+                await self.auth.ensure_valid(self._email, self._password)
+            except LymowError as auth_err:
+                # Token refresh hard-failed mid-run (refresh token expired/revoked) and
+                # there's no stored password to recover with → escalate to HA's reauth
+                # flow now, instead of leaving the user stale until the next restart.
+                # async_start_reauth is idempotent (HA won't open duplicate flows).
+                if self._config_entry and not (self._email and self._password):
+                    _LOGGER.warning(
+                        "Token refresh failed for %s — starting re-authentication", self.thing_name
+                    )
+                    self._config_entry.async_start_reauth(self.hass)
+                    return
+                raise
             await self._connect_mqtt()
             _LOGGER.info("MQTT reconnected for %s", self.thing_name)
         except Exception:
