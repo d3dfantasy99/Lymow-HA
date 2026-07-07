@@ -841,3 +841,70 @@ def derive_current_channel(state: dict[str, Any]) -> dict[str, Any] | None:
             "distance_m": round(dist, 2),
         }
     return best
+
+
+# The charger spot sits OUTSIDE every zone and channel, so undocking/docking there would
+# read as Off-Map. Treat positions within this many metres of the dock as not-a-breach.
+DOCK_EXEMPT_M = 4.0
+
+
+def _near_dock(state: dict[str, Any], radius: float = DOCK_EXEMPT_M) -> bool:
+    """True if the robot's ENU pose is within `radius` m of the dock (reported or derived).
+    Both are ENU metres, so the distance is direct."""
+    pose = get_robot_pose(state)
+    if pose is None:
+        return False
+    try:
+        rx = float(pose["x"] if isinstance(pose, dict) else pose.x)
+        ry = float(pose["y"] if isinstance(pose, dict) else pose.y)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+    r2 = radius * radius
+    for src in ("chargingStationLoc", "derived_dock"):
+        dk = state.get(src)
+        if not isinstance(dk, dict):
+            continue
+        try:
+            dx, dy = float(dk["x"]), float(dk["y"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (rx - dx) ** 2 + (ry - dy) ** 2 <= r2:
+            return True
+    return False
+
+
+def resolve_location(state: dict[str, Any], docked: bool):
+    """Single source of truth for WHERE the mower is — the instantaneous resolution that
+    Location State, Current Zone, and Current Channel all read from (so they can never
+    disagree). Precedence: No-Go > Zone > Channel > Off-Map.
+
+    Returns (location_label, current_zone, current_channel, channel_info), or None when the
+    position can't be evaluated (paused/idle/partial frame or no GPS) so the caller HOLDS the
+    previous sticky values. The Off-Map result is INSTANTANEOUS — the caller debounces it
+    (sustained off-map) before treating it as a real geofence breach, so GPS jitter near a
+    boundary can't blip a false breach.
+
+    States: "Docked" · "Zone: <name>" · "Channel: <label>" · "No Go: <name>" · "Off-Map".
+    Current Zone mirrors it cleanly: zone name · "No Go: <name>" · "Docked" · "Transit"
+    (in a channel) · "Off-Map". Current Channel: label · "None" (in a zone/docked) · "Off-Map".
+    """
+    if docked:
+        return ("Docked", "Docked", "None", None)
+    if not (_localization_active(state)
+            and robot_gps_from_state(state) and get_enu_base_point(state) is not None):
+        return None  # idle / paused / partial / no-fix → caller keeps previous (sticky)
+
+    zone = derive_current_zone(state)
+    if zone and str(zone).startswith("No Go"):
+        return (zone, zone, "None", None)                       # no-go intrusion = breach
+    if zone:
+        return (f"Zone: {zone}", zone, "None", None)            # in a known zone
+    channel = derive_current_channel(state)
+    if channel:
+        lbl = channel.get("label") or "Channel"
+        return (f"Channel: {lbl}", "Transit", lbl, channel)     # in a transit corridor
+    # Not in a zone or channel. If we're at/near the charger (the dock spot is outside every
+    # zone and channel), this is an undock/dock maneuver, NOT a breach — hold previous.
+    if _near_dock(state):
+        return None
+    return ("Off-Map", "Off-Map", "Off-Map", None)              # in NOTHING known → breach (debounce!)

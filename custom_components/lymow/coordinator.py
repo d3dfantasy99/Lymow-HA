@@ -104,6 +104,7 @@ from .state import (
     _localization_active,
     derive_current_zone,
     derive_current_channel,
+    resolve_location,
     get_enu_base_point,
     get_robot_pose,
     merge_pboutput,
@@ -121,8 +122,13 @@ from .obstacles import detect_obstacles
 from .pass_coverage import analyze_pass_coverage
 from .zone_stats import assign_to_zones, point_in_polygon
 from .coverage_worker import compute_coverage
+from .zone_coverage import ZoneCoverageHistory, cells_for_points
 
 _LOGGER = logging.getLogger(__name__)
+
+# Sustained seconds the mower must resolve to Off-Map (in no zone, no channel, while active)
+# before we declare a geofence breach — guards against GPS jitter blipping at a boundary.
+LOCATION_OFFMAP_DEBOUNCE_S = 8.0
 
 _REST_POLL_INTERVAL = timedelta(minutes=15)
 _REFRESH_INTERVAL   = 30          # seconds — periodic config/net/RTK refresh
@@ -687,33 +693,34 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             or self._state.get("workStatus") in (WORK_STATUS_CHARGING, WORK_STATUS_CHARGING_FULL)
             or bool(self._state.get("isCharging"))
         )
-        if _docked:
-            # Parked on the dock — give the sensors a meaningful state instead of unknown.
-            self._state["currentZone"] = "Docked"
-            self._state["currentChannel"] = "None"
-            self._state["currentChannelInfo"] = None
-        elif _localization_active(self._state) and robot_gps_from_state(self._state) and get_enu_base_point(self._state):
-            # Zone WINS over channel: while the mower's position is inside any zone
-            # (incl. an overlap held sticky), it is mowing that zone — the channel
-            # buffer must NOT trigger a transit. Only once the mower is outside every
-            # zone (derive_current_zone -> None) do we consult the channel. This is
-            # the same exclusive-area principle as the zone-overlap handling.
-            zone = derive_current_zone(self._state)
-            if zone:
-                self._state["currentZone"] = zone
-                self._state["currentChannel"] = None  # in a zone → not in a channel (unknown, not "Clear")
-                self._state["currentChannelInfo"] = None
+        # Single source of truth: resolve WHERE the mower is once (No-Go > Zone > Channel >
+        # Off-Map), then Location State + Current Zone + Current Channel all read from it so
+        # they can never disagree (which was the unknown-flicker bug). Off-Map (in no zone,
+        # no channel, while active) = the negative-space geofence breach — DEBOUNCED so GPS
+        # jitter at a boundary can't blip a false breach.
+        _loc = resolve_location(self._state, _docked)
+        if _loc is not None:
+            _label, _zone, _chan, _chan_info = _loc
+            if _label == "Off-Map":
+                now = time.monotonic()
+                if self._offmap_since is None:
+                    self._offmap_since = now
+                if now - self._offmap_since >= LOCATION_OFFMAP_DEBOUNCE_S:
+                    self._state["locationState"] = _label
+                    self._state["currentZone"] = _zone
+                    self._state["currentChannel"] = _chan
+                    self._state["currentChannelInfo"] = _chan_info
+                # else: within the debounce window — HOLD previous (don't commit a breach yet)
             else:
-                channel = derive_current_channel(self._state)
-                if channel:
-                    self._state["currentChannel"] = channel.get("label")
-                    self._state["currentChannelInfo"] = channel
-                    self._state["currentZone"] = None  # in a channel → not in a zone (unknown, not "Clear")
-                # else: outside every zone AND channel — unknown. Keep the previous
-                # value (a single partial/edge frame shouldn't blank it); the zone-edge
-                # buffer above already prevents most perimeter-lap dropouts.
-        # else: paused / error / idle / partial frame — keep previous (sticky).
-        # Docking (returning) IS localization-active, so it re-derives above even
+                self._offmap_since = None
+                self._state["locationState"] = _label
+                self._state["currentZone"] = _zone
+                self._state["currentChannel"] = _chan
+                self._state["currentChannelInfo"] = _chan_info
+        else:
+            # paused / idle / partial / no-fix — keep previous (sticky); not an active breach.
+            self._offmap_since = None
+        # Docking (returning) IS localization-active, so it re-resolves above even
         # after a cleanReport reset currentZone=None on task cancel.
 
 
