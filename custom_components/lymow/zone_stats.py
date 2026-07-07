@@ -84,6 +84,13 @@ def assign_to_zones(
     """
     obstacle_events = obstacle_events or []
     polys = _build_polys(zones)
+    # Pre-compute each zone's bbox so a point far from a zone is rejected with 4 comparisons
+    # instead of a full point-in-polygon ray-cast. Identical result (a point inside the
+    # polygon is always inside its bbox); this is the per-pull hot path over the breadcrumb.
+    polys_bb = [(key, name, poly,
+                 min(p[0] for p in poly), min(p[1] for p in poly),
+                 max(p[0] for p in poly), max(p[1] for p in poly))
+                for key, name, poly in polys]
 
     # Cell grid for per-zone area: 0.25 m cells, ±1 cell dilation ≈ the 16 in (0.41 m) cut.
     import math
@@ -101,7 +108,9 @@ def assign_to_zones(
             px, py = float(pt[0]), float(pt[1])
         except (IndexError, TypeError, ValueError):
             continue
-        for key, _name, poly in polys:
+        for key, _name, poly, x0, y0, x1, y1 in polys_bb:
+            if px < x0 or px > x1 or py < y0 or py > y1:
+                continue
             if point_in_polygon(px, py, poly):
                 stats[key]["coverage_points"] += 1
                 cx0 = int(math.floor(px / CELL)); cy0 = int(math.floor(py / CELL))

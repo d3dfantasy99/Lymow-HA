@@ -204,6 +204,18 @@ service: lymow.cancel_task
 
 ---
 
+## Coverage & mow history
+
+Per-zone coverage and last-mowed times **persist across restarts and new mows** — they're
+saved to the integration's config entry, not just held in memory. Each zone keeps its mowed
+footprint on the map, tinted by **mow-age** (brighter = mowed more recently, fading as it
+ages past your **Mow Interval**), and the **Overdue Zones** / **Zone Age** sensors track how
+long it's been since each zone was last cut. A zone you mowed last week still shows its
+coverage today, and starting a fresh task only clears the zone(s) actually being mowed — so a
+partial mow never wipes the rest of the map.
+
+---
+
 ## Session history automations
 
 The `event.lymow_<<mowername>>_last_session` entity fires whenever a new completed session is detected. Use it to send a notification when mowing finishes:

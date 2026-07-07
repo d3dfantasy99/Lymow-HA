@@ -7,7 +7,12 @@ from homeassistant.const import EntityCategory, PERCENTAGE, UnitOfLength
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DEFAULT_CHANNEL_BUFFER_M, DOMAIN, F_CUT_HEIGHT
+from .const import (
+    DEFAULT_CHANNEL_BUFFER_M,
+    DEFAULT_MOW_INTERVAL_DAYS,
+    DOMAIN,
+    F_CUT_HEIGHT,
+)
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
 
@@ -22,8 +27,36 @@ async def async_setup_entry(
             LymowRechargeThreshold(coord),
             LymowResumeThreshold(coord),
             LymowChannelBuffer(coord),
+            LymowMowInterval(coord),
         ],
         update_before_add=False)
+
+
+class LymowMowInterval(LymowEntity, NumberEntity):
+    """How often each zone should be mowed (days). One knob for the whole mow-age
+    feature: it sets the colour ramp on the Zone Age map style AND the threshold for
+    the Overdue Zones sensor ("not mowed within this many days" = overdue). Local
+    setting — not sent to the mower; persisted with the coverage history."""
+
+    _attr_name = "Mow Interval"
+    _attr_icon = "mdi:calendar-refresh"
+    _attr_native_min_value = 1
+    _attr_native_max_value = 60
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = "d"
+    _attr_mode = NumberMode.BOX
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "mow_interval_days")
+
+    @property
+    def native_value(self) -> float | None:
+        val = (self.coordinator.data or {}).get("mow_interval_days")
+        return float(val) if val is not None else DEFAULT_MOW_INTERVAL_DAYS
+
+    async def async_set_native_value(self, value: float) -> None:
+        self.coordinator.set_mow_interval_days(value)
 
 
 class LymowChannelBuffer(LymowEntity, NumberEntity):

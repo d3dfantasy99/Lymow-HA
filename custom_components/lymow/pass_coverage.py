@@ -41,14 +41,43 @@ def _dist_pt_seg(px, py, ax, ay, bx, by) -> float:
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
-def _near_boundary(pt, polys, dist) -> bool:
+def _seg_d2(px, py, ax, ay, bx, by) -> float:
+    """SQUARED point-to-segment distance (no sqrt) — for threshold comparisons."""
+    dx, dy = bx - ax, by - ay
+    d2 = dx * dx + dy * dy
+    if d2 <= 1e-12:
+        ex, ey = px - ax, py - ay
+        return ex * ex + ey * ey
+    t = ((px - ax) * dx + (py - ay) * dy) / d2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    ex, ey = px - (ax + t * dx), py - (ay + t * dy)
+    return ex * ex + ey * ey
+
+
+def _poly_bbox(poly):
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _near_boundary(pt, polys_bb, dist) -> bool:
+    """True if pt is within `dist` of any zone edge. `polys_bb` = [(poly, bbox), …] with
+    PRE-COMPUTED bboxes so far-away zones are skipped before touching their edges, and the
+    comparison is on squared distance (no per-edge sqrt). Identical result to the naive
+    all-edges scan, just O(nearby-edges) instead of O(all-edges-of-all-zones)."""
     px, py = pt
-    for poly in polys:
+    d2 = dist * dist
+    for poly, (x0, y0, x1, y1) in polys_bb:
+        if px < x0 - dist or px > x1 + dist or py < y0 - dist or py > y1 + dist:
+            continue                                  # point can't be within dist of this zone
         n = len(poly)
         for i in range(n):
             ax, ay = poly[i]
             bx, by = poly[(i + 1) % n]
-            if _dist_pt_seg(px, py, ax, ay, bx, by) <= dist:
+            if _seg_d2(px, py, ax, ay, bx, by) <= d2:
                 return True
     return False
 
@@ -60,12 +89,13 @@ def tag_perimeter_infill(rows, zone_polys, perim_dist: float = 0.7, frac: float 
     (within perim_dist metres) — i.e. it traces the edge rather than crossing the
     interior in a straight boustrophedon line.
     """
+    polys_bb = [(p, _poly_bbox(p)) for p in zone_polys if len(p) >= 2]
     for row in rows:
         pts = row.get("pts") or []
         if not pts:
             row["kind"] = "infill"
             continue
-        near = sum(1 for p in pts if _near_boundary(p, zone_polys, perim_dist))
+        near = sum(1 for p in pts if _near_boundary(p, polys_bb, perim_dist))
         row["kind"] = "perimeter" if near >= frac * len(pts) else "infill"
     return rows
 
