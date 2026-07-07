@@ -210,17 +210,36 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return {_ZH_REMAP.get(k, k): vv for k, vv in v.items() if k not in _ZH_DROP}
         _items = list((self._state.get("zone_history") or {}).items())
         _zh_mig, _by_name = {}, {}
+        _n_canon = _n_folded = _n_kept = 0
         for _k, _v in _items:                       # pass 1: canonical hashId-keyed records
             if isinstance(_v, dict) and _v.get("zone_id"):
                 _zh_mig[_k] = _zh_remap(_v)
                 _by_name[_zh_mig[_k].get("zone_name")] = _k
+                _n_canon += 1
         for _k, _v in _items:                       # pass 2: fold legacy name-keyed halves in
             if isinstance(_v, dict) and not _v.get("zone_id"):
                 _tgt = _by_name.get(_k)             # legacy key WAS the zone name
                 if _tgt:
                     for _kk, _vv in _zh_remap(_v).items():
                         _zh_mig[_tgt].setdefault(_kk, _vv)
+                    _n_folded += 1
+                elif _k not in _zh_mig:
+                    # No canonical hashId record to fold into. KEEP it rather than drop it —
+                    # never lose a user's history on an older/unforeseen format. It stays under
+                    # its original key (hashId-keyed entities won't surface it, but the data is
+                    # preserved + persisted + recoverable). [hardening 2026-06-22]
+                    _zh_mig[_k] = _zh_remap(_v)
+                    _n_kept += 1
         self._state["zone_history"] = _zh_mig
+        if _n_kept:
+            _LOGGER.warning(
+                "zone_history migration preserved %d legacy record(s) with no canonical "
+                "hashId match (kept, NOT dropped) — %d canonical, %d folded. If zone history "
+                "looks wrong after upgrade, please report with this log.",
+                _n_kept, _n_canon, _n_folded)
+        elif _items:
+            _LOGGER.debug("zone_history migration: %d canonical, %d legacy folded",
+                          _n_canon, _n_folded)
         # Derived dock location (captured from the mower's pose while charging) — restored
         # so the dock marker is present immediately, even before the mower reports it.
         if config_entry and config_entry.data.get("derived_dock"):
