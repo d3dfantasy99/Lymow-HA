@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -25,6 +26,7 @@ from .const import (
     CLEAN_MODE_CHESS_BOARD,
     CLEAN_MODE_PERIMETER_ONLY,
     CLEAN_MODE_ZIGZAG,
+    DEFAULT_MOW_INTERVAL_DAYS,
     DOMAIN,
     F_BATTERY,
     F_CLEAN_AREA,
@@ -39,6 +41,7 @@ from .const import (
     F_RTK_STATUS,
     F_SERIAL_NO,
     F_WIFI_SIGNAL,
+    MANUFACTURER,
     NET_SIM_SIGNAL,
     NET_WIFI_SIGNAL,
     RTK_STATUS_LABELS,
@@ -1066,7 +1069,7 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)] + [LymowZoneHistorySensor(coord)] + [LymowCurrentChannelSensor(coord)],
+        [LymowSensor(coord, desc) for desc in SENSORS] + [LymowMapGeoJsonSensor(coord)] + [LymowZoneHistorySensor(coord)] + [LymowCurrentChannelSensor(coord)] + [LymowOverdueZonesSensor(coord)] + [LymowLocationStateSensor(coord)],
         update_before_add=False,
     )
 
@@ -1113,7 +1116,7 @@ class LymowCurrentChannelSensor(LymowEntity, SensorEntity):
     def extra_state_attributes(self):
         info = (self.coordinator.data or {}).get("currentChannelInfo") or {}
         return {
-            "description": "The connector channel the mower is transiting (the corridor linking two zones), computed locally by point-in-polygon of its position against each channel. When it's inside both a zone and a channel, the zone wins and this reads 'unknown'.",
+            "description": "The connector channel the mower is transiting (the corridor linking two zones), computed locally by point-in-polygon of its position against each channel. In a zone it reads 'None'; genuinely outside all zones AND channels (a geofence breach) it reads 'Off-Map'.",
             "channel_id": info.get("channel_id"),
             "zone_1": info.get("zone1"),
             "zone_2": info.get("zone2"),
@@ -1190,7 +1193,24 @@ class LymowSensor(LymowEntity, SensorEntity):
         return attrs or None
 
 
-class LymowZonePerZoneSensor(LymowEntity, SensorEntity, RestoreEntity):
+class _ZoneSubDeviceEntity(LymowEntity):
+    """Mixin: place an entity under a dedicated '<name> Zones' sub-device that hangs
+    off the main mower (via_device). Yards with dozens of zones generate dozens of
+    per-zone entities; grouping them into their own collapsible device card keeps the
+    main device page from becoming an endless scroll."""
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "identifiers": {(DOMAIN, f"{self.coordinator.thing_name}_zones")},
+            "name": f"{self._device_name} Zones",
+            "manufacturer": MANUFACTURER,
+            "model": "Zone History",
+            "via_device": (DOMAIN, self.coordinator.thing_name),
+        }
+
+
+class LymowZonePerZoneSensor(_ZoneSubDeviceEntity, SensorEntity, RestoreEntity):
     """One sensor PER zone — state is the last-mowed timestamp, attributes carry that
     zone's unified history record (mow_count, mowing_minutes, derived per-zone mow time,
     session_minutes, battery_used, coverage, areas). hashId-anchored so an app rename keeps
@@ -1243,7 +1263,7 @@ class LymowZonePerZoneSensor(LymowEntity, SensorEntity, RestoreEntity):
         keys = ("zone_name", "mow_count", "mowing_minutes", "mowing_minutes_derived",
                 "session_minutes", "battery_used_pct", "coverage_points",
                 "area_covered_m2", "session_area_m2", "zone_area_m2",
-                "path_spacing_in", "cut_overlap_pct", "end_type",
+                "path_spacing_cm", "path_spacing_in", "cut_overlap_pct", "end_type",
                 "per_zone_stats_available")
         out = {k: rec.get(k) for k in keys if k in rec}
         out["description"] = ("Per-zone mow history. PER-SESSION (last mow, matches the "
@@ -1255,6 +1275,100 @@ class LymowZonePerZoneSensor(LymowEntity, SensorEntity, RestoreEntity):
                               "CLOUD SESSION TOTALS (all zones): mowing_minutes, session_area_m2; "
                               "zone_area_m2 = the zone's geometric size.")
         return out
+
+
+class LymowLocationStateSensor(LymowEntity, SensorEntity):
+    """Where the mower is, as ONE authoritative state — the turnkey geofence signal.
+
+    Resolved locally (No-Go > Zone > Channel > Off-Map, debounced) so it never disagrees
+    with Current Zone / Current Channel. States:
+      Docked · Zone: <name> · Channel: <label> · No Go: <name> · Off-Map.
+    'No Go: …' and 'Off-Map' are geofence breaches — automate on `is_breach` (or the state)
+    to alarm/notify/track. 'Off-Map' means the mower is outside EVERY known zone and channel
+    while active (negative-space whole-property geofence)."""
+
+    _attr_icon = "mdi:map-marker-radius"
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "location_state")
+        self._attr_name = "Location State"
+
+    @property
+    def native_value(self):
+        return (self.coordinator.data or {}).get("locationState")
+
+    @property
+    def extra_state_attributes(self):
+        st = (self.coordinator.data or {}).get("locationState") or ""
+        no_go = st.startswith("No Go")
+        off_map = st == "Off-Map"
+        return {
+            "description": ("Authoritative location of the mower (No-Go > Zone > Channel > "
+                            "Off-Map, debounced). 'No Go: …' or 'Off-Map' = geofence breach. "
+                            "Off-Map = outside every known zone AND channel while active."),
+            "zone": (self.coordinator.data or {}).get("currentZone"),
+            "channel": (self.coordinator.data or {}).get("currentChannel"),
+            "is_breach": no_go or off_map,
+            # String mirror of is_breach for dashboard conditional cards — a tile conditional
+            # can't reliably match a boolean attribute, but matches a string cleanly. [Nate]
+            "geofence_status": "breach" if (no_go or off_map) else "ok",
+            "off_map": off_map,
+            "in_no_go": no_go,
+        }
+
+
+class LymowOverdueZonesSensor(LymowEntity, SensorEntity):
+    """How many zones are overdue for a mow (#2). A zone is overdue when its last
+    COMPLETED mow is older than the Mow Interval — so a cancelled / rained-out zone
+    correctly stays "due". Never-mowed zones are NOT counted (unknown, not overdue).
+    State = the count; the attribute lists the overdue zones (oldest first) so you can
+    notify on it ("3 zones overdue, including Front Right") instead of reading the map."""
+
+    _attr_icon = "mdi:mower"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "overdue_zones")
+        self._attr_name = "Overdue Zones"
+
+    def _compute(self) -> tuple[int, list[dict]]:
+        data = self.coordinator.data or {}
+        ages = data.get("zone_last_mowed") or {}          # {zone_key: epoch-seconds | None}
+        if not ages:
+            return 0, []
+        zones = (data.get("btMap") or {}).get("zones") or []
+        name_by_key = {(z.get("hashId") or z.get("name")): (z.get("name") or z.get("hashId"))
+                       for z in zones}
+        interval_days = float(data.get("mow_interval_days") or DEFAULT_MOW_INTERVAL_DAYS)
+        now = time.time()
+        overdue = []
+        for key, ts in ages.items():
+            if not ts:
+                continue                                   # never completed → unknown, not overdue
+            days = (now - float(ts)) / 86400.0
+            if days > interval_days:
+                overdue.append({"zone": name_by_key.get(key, key), "days_since_mowed": round(days, 1)})
+        overdue.sort(key=lambda z: z["days_since_mowed"], reverse=True)
+        return len(overdue), overdue
+
+    @property
+    def native_value(self) -> int:
+        return self._compute()[0]
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        count, overdue = self._compute()
+        data = self.coordinator.data or {}
+        return {
+            "mow_interval_days": float(data.get("mow_interval_days") or DEFAULT_MOW_INTERVAL_DAYS),
+            "overdue_zones": [z["zone"] for z in overdue],
+            "detail": overdue,
+            "oldest_zone": overdue[0]["zone"] if overdue else None,
+            "oldest_days": overdue[0]["days_since_mowed"] if overdue else None,
+            "description": ("Zones whose last COMPLETED mow is older than the Mow Interval. "
+                            "Cancelled/rained-out zones stay due (timestamp only advances on "
+                            "completion); never-mowed zones are not counted."),
+        }
 
 
 class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):

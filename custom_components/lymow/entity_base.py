@@ -18,16 +18,24 @@ class LymowEntity(CoordinatorEntity[LymowCoordinator]):
         self._attr_unique_id = f"{coordinator.thing_name}_{unique_suffix}"
 
     @property
-    def device_info(self) -> dict:
+    def _device_name(self) -> str:
+        """Resolved display name of the mower device (used for the device card and
+        any sub-device names that hang off it)."""
         info = self.coordinator.device_info_data or {}
         data = self.coordinator.data or {}
-
-        name = (
+        return (
             self.coordinator.config_entry.data.get("device_name")
             or info.get("deviceName")
             or data.get("deviceName")
             or f"Lymow {self.coordinator.thing_name}"
         )
+
+    @property
+    def device_info(self) -> dict:
+        info = self.coordinator.device_info_data or {}
+        data = self.coordinator.data or {}
+
+        name = self._device_name
 
         model = (
             info.get("model")

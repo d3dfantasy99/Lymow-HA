@@ -176,7 +176,7 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord), LymowVehicleLedSwitch(coord), LymowDockOnErrorSwitch(coord), LymowRainyMowingSwitch(coord), LymowDiagnosticCaptureSwitch(coord)],
+        [LymowSwitch(coord, desc) for desc in SWITCHES] + [LymowHeadlightsSwitch(coord), LymowDockOnErrorSwitch(coord), LymowRainyMowingSwitch(coord), LymowDiagnosticCaptureSwitch(coord), LymowDimByAgeSwitch(coord)],
         update_before_add=False,
     )
 
@@ -392,3 +392,29 @@ class LymowDiagnosticCaptureSwitch(LymowEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.set_diag_capture(False)
+
+
+class LymowDimByAgeSwitch(LymowEntity, SwitchEntity):
+    """Dim Coverage By Age — when ON, the stripe coverage styles (Green Checker / Logical
+    Passes / Gradient / Activity) are dimmed per zone by how long since that zone was last
+    mowed: freshly-mowed zones stay bright, overdue ones go darker/duller (using the same
+    Mow Interval as the Zone Age style and Overdue sensor). The stripes stay visible through
+    the dimming. Local setting, persisted, NOT sent to the mower."""
+
+    _attr_name = "Dim Coverage By Age"
+    _attr_icon = "mdi:brightness-4"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_extra_state_attributes = {"description": "Dims the striped coverage map per zone by mow-age (older = darker), so you can see at a glance what's overdue without leaving your normal Green Checker / Logical Passes view. Uses the Mow Interval as the scale. Does not affect the dedicated 'Zone Age' coverage style. Local; persisted."}
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "dim_by_age")
+
+    @property
+    def is_on(self) -> bool:
+        return bool((self.coordinator.data or {}).get("dim_by_age", False))
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.set_dim_by_age(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.set_dim_by_age(False)

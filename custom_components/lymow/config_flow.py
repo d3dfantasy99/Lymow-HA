@@ -46,6 +46,7 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._region    = "eu-west-1"
         self._oauth_state    = ""
         self._pkce_verifier  = ""
+        self._reauth_entry: config_entries.ConfigEntry | None = None
 
     # ── Step 1: Choose auth method ──────────────────────────────
 
@@ -99,6 +100,8 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected error during Lymow auth")
                 errors["base"] = "unknown"
             else:
+                if self._reauth_entry is not None:
+                    return await self._finish_reauth()
                 if not self._devices:
                     return self.async_abort(reason="no_devices")
                 if len(self._devices) == 1:
@@ -183,6 +186,8 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     description_placeholders={"auth_url": self._oauth_url()},
                 )
             else:
+                if self._reauth_entry is not None:
+                    return await self._finish_reauth()
                 if not self._devices:
                     return self.async_abort(reason="no_devices")
                 if len(self._devices) == 1:
@@ -247,12 +252,76 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
+    # ── Re-authentication ───────────────────────────────────────
+    # Two entry points, both end in _finish_reauth (update tokens in place, no
+    # delete/re-add): async_step_reauth = AUTOMATIC (HA raises this on
+    # ConfigEntryAuthFailed — token expired); async_step_reconfigure = MANUAL
+    # ("Reconfigure" button) so a user can refresh proactively any time.
+
+    async def async_step_reauth(self, entry_data: dict) -> FlowResult:
+        self._reauth_entry = self.hass.config_entries.async_get_entry(
+            self.context["entry_id"]
+        )
+        self._region = entry_data.get(CONF_REGION) or self._region
+        self._email = entry_data.get(CONF_EMAIL, "")
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reconfigure(self, user_input: dict | None = None) -> FlowResult:
+        """Manual 'Reconfigure' — re-authenticate on demand."""
+        if self._reauth_entry is None:
+            self._reauth_entry = self.hass.config_entries.async_get_entry(
+                self.context["entry_id"]
+            )
+            self._region = self._reauth_entry.data.get(CONF_REGION, self._region)
+            self._email = self._reauth_entry.data.get(CONF_EMAIL, "")
+        return await self.async_step_reauth_confirm(user_input)
+
+    async def async_step_reauth_confirm(self, user_input: dict | None = None) -> FlowResult:
+        """Route to the auth method the entry was created with."""
+        method = (
+            self._reauth_entry.data.get(CONF_AUTH_METHOD, AUTH_METHOD_PASSWORD)
+            if self._reauth_entry else AUTH_METHOD_PASSWORD
+        )
+        if method == AUTH_METHOD_GOOGLE:
+            return await self.async_step_google(user_input)
+        return await self.async_step_password(user_input)
+
+    async def _finish_reauth(self) -> FlowResult:
+        """Write fresh tokens onto the existing entry, reload it, and — for
+        multi-mower accounts — propagate the same fresh tokens to sibling entries
+        of the SAME Cognito account (matched by the id_token 'sub'), so one
+        re-auth fixes every mower instead of N separate prompts."""
+        new_tokens = {
+            "refresh_token": self._auth.refresh_token,
+            "id_token":      self._auth.id_token,
+        }
+        new_sub = _jwt_sub(self._auth.id_token)
+        if new_sub:
+            for entry in self.hass.config_entries.async_entries(DOMAIN):
+                if entry.entry_id == self._reauth_entry.entry_id:
+                    continue
+                if _jwt_sub(entry.data.get("id_token", "")) == new_sub:
+                    self.hass.config_entries.async_update_entry(
+                        entry, data={**entry.data, **new_tokens}
+                    )
+                    self.hass.async_create_task(
+                        self.hass.config_entries.async_reload(entry.entry_id)
+                    )
+
+        new_data = {**self._reauth_entry.data, **new_tokens}
+        if self._password:
+            new_data[CONF_EMAIL] = self._email
+            new_data[CONF_PASSWORD] = self._password
+        return self.async_update_reload_and_abort(
+            self._reauth_entry, data=new_data, reason="reauth_successful"
+        )
+
     @staticmethod
     def async_get_options_flow(entry: config_entries.ConfigEntry) -> LymowOptionsFlow:
         return LymowOptionsFlow(entry)
 
 
-class LymowOptionsFlow(config_entries.OptionsFlow):
+class LymowOptionsFlow(config_entries.OptionsFlowWithReload):
     def __init__(self, entry: config_entries.ConfigEntry) -> None:
         self._entry = entry
 
@@ -267,6 +336,10 @@ class LymowOptionsFlow(config_entries.OptionsFlow):
                     "scan_interval",
                     default=self._entry.options.get("scan_interval", DEFAULT_SCAN_INTERVAL),
                 ): vol.All(int, vol.Range(min=10, max=300)),
+                vol.Required(
+                    "render_multiprocessing",
+                    default=self._entry.options.get("render_multiprocessing", True),
+                ): bool,
             }),
         )
 
@@ -367,6 +440,19 @@ function copyCode(){{
 </script>
 </body></html>"""
         return web.Response(text=page, content_type="text/html")
+
+
+def _jwt_sub(id_token: str) -> str | None:
+    """Read the Cognito user id ('sub') from a JWT id_token without verifying it
+    (we already trust these tokens — this is only to match sibling entries of the
+    same account for multi-mower token propagation). Returns None on any problem."""
+    try:
+        import base64 as _b64, json as _json
+        payload = id_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)          # restore base64 padding
+        return _json.loads(_b64.urlsafe_b64decode(payload)).get("sub")
+    except Exception:
+        return None
 
 
 def _thing_name(d: dict) -> str:

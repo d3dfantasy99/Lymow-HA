@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 from .const import (
+    DEFAULT_MOW_INTERVAL_DAYS,
     F_IS_CHARGING,
     WORK_STATUS_ERROR, WORK_STATUS_EMERGENCY_STOP,
     WORK_STATUS_CHARGING, WORK_STATUS_CHARGING_FULL, WORK_STATUS_DOCKING,
@@ -54,6 +55,136 @@ GREY        = (156, 163, 175, 255)
 DONE_GREEN  = ( 16, 185, 129, 230)   # bold emerald — "this zone is DONE" (Paths Off status view)
 NODATA_GREY = (148, 163, 184,  80)   # faint — not mowed this session / no data
 ACTIVITY_ZONE_FILL = (30, 41, 59, 150)   # dim slate base for the Activity path overlay
+
+# Zone Age style (#2): tint each zone by how long since it was last COMPLETED mow.
+# Green-only, "darker = older" — matches reality (long grass is darker/denser) and so it
+# never clashes in HUE with the Grass Stripes greens (it's a separate style, not overlaid).
+_AGE_FRESH = (140, 224, 120)         # just mowed — bright lawn
+_AGE_OLD   = (18,  74,  36)          # at/over the mow interval — deep, dull, overgrown
+_AGE_NEVER = (148, 163, 184, 70)     # never mowed = UNKNOWN (neutral grey), NOT "oldest"
+
+
+def _place_label_xy(cx, cy, poly, label_w, nogo_boxes):
+    """Pick a label anchor that (a) sits inside the zone polygon with the label's full
+    horizontal span inside it, and (b) is clear of every no-go bounding box (their orange
+    fill is always drawn and would otherwise cover the text). Tries the centroid first,
+    then a widening ring search; falls back to the centroid if nothing fits (tiny zone
+    fully occupied by a no-go). Fixes labels half-covered by a no-go and labels that drift
+    off an irregular zone's edge."""
+    import math
+    hw, hh = label_w / 2.0, 7.0
+
+    def _hits_nogo(lx, ly):
+        for nx0, ny0, nx1, ny1 in nogo_boxes:
+            if not (lx + hw < nx0 or lx - hw > nx1 or ly + hh < ny0 or ly - hh > ny1):
+                return True
+        return False
+
+    def _ok(lx, ly):
+        return (point_in_polygon(lx, ly, poly)
+                and point_in_polygon(lx - hw, ly, poly)
+                and point_in_polygon(lx + hw, ly, poly)
+                and not _hits_nogo(lx, ly))
+
+    if _ok(cx, cy):
+        return cx, cy
+    for r in range(12, 220, 11):
+        for ang in range(0, 360, 30):
+            lx = cx + r * math.cos(math.radians(ang))
+            ly = cy + r * math.sin(math.radians(ang))
+            if _ok(lx, ly):
+                return lx, ly
+    return cx, cy
+
+
+# Dim-by-age modifier: a deep green-black veil whose opacity grows with mow-age, so it
+# DARKENS the stripe styles (keeping the green hue) instead of replacing them.
+_DIM_VEIL = (10, 38, 18)
+_DIM_MAX_ALPHA = 130
+
+
+def _dim_alpha(last_mowed, now_ts: float, interval_days: float) -> int:
+    """Veil opacity (0.._DIM_MAX_ALPHA) to dim a zone by mow-age. 0 if never mowed
+    (unknown — don't dim) or freshly mowed; ramps to max at/over the mow interval."""
+    if not last_mowed:
+        return 0
+    age_days = max(0.0, (now_ts - float(last_mowed)) / 86400.0)
+    t = min(1.0, age_days / max(1.0, interval_days))
+    return int(t * _DIM_MAX_ALPHA)
+
+
+def _age_color(last_mowed, now_ts: float, interval_days: float) -> tuple:
+    """RGBA tint for a zone by mow-age. None/0 last_mowed -> neutral grey (unknown, not
+    overdue). Otherwise lerp bright->deep green by age/interval (clamped), so a fresh zone
+    glows and an overdue one goes dark green."""
+    if not last_mowed:
+        return _AGE_NEVER
+    age_days = max(0.0, (now_ts - float(last_mowed)) / 86400.0)
+    t = min(1.0, age_days / max(1.0, interval_days))
+    return (
+        int(_AGE_FRESH[0] + (_AGE_OLD[0] - _AGE_FRESH[0]) * t),
+        int(_AGE_FRESH[1] + (_AGE_OLD[1] - _AGE_FRESH[1]) * t),
+        int(_AGE_FRESH[2] + (_AGE_OLD[2] - _AGE_FRESH[2]) * t),
+        170,
+    )
+
+
+def _render_persistent_masks(masks, now_ts, interval_days, sx, sy, scale, size,
+                             cell_default: float = 0.25, clip_polys=None, nogo_polys=None):
+    """Draw retained per-zone coverage from the persistent occupancy masks
+    (state["zone_coverage_history"]). Unlike the live breadcrumb, these survive new tasks AND
+    restarts — so a previously-mowed zone keeps its coverage on the map, and a partially-mowed
+    (e.g. rained-out) zone shows ONLY its covered cells instead of reading as fully done. Each
+    zone is tinted by mow-age (dimmer = older); a zone that has coverage but no recorded
+    completion renders fresh-green rather than the grey "unknown" tint. The live breadcrumb
+    swath composites on top afterwards for the zone being actively mowed. [Nate 2026-06-21]"""
+    ov = Image.new("RGBA", size, (0, 0, 0, 0))
+    if not masks:
+        return ov
+    d = ImageDraw.Draw(ov, "RGBA")
+    _fresh = (_AGE_FRESH[0], _AGE_FRESH[1], _AGE_FRESH[2], 170)
+    _cm = cell_default
+    for m in masks.values():
+        if not isinstance(m, dict):
+            continue
+        cells = m.get("cells") or []
+        if not cells:
+            continue
+        cm = m.get("cell_m") or cell_default
+        _cm = cm
+        lm = m.get("last_mowed")
+        col = _age_color(lm, now_ts, interval_days) if lm else _fresh
+        s = max(1.0, scale * cm * 0.95)   # near-full cell (slight overlap closes grid seams)
+        for c in cells:
+            try:
+                px, py = sx(c[0] * cm), sy(c[1] * cm)
+            except (IndexError, TypeError, ValueError):
+                continue
+            d.rectangle((px - s, py - s, px + s, py + s), fill=col)
+    # Smooth the blocky 0.25 m cell grid into organic coverage: a sub-cell GaussianBlur rounds
+    # the square corners, then a steep alpha rescale (clamped) re-solidifies the body so the
+    # edge reads as a clean anti-aliased boundary rather than a hazy glow. Blur scales with the
+    # cell's pixel size so it smooths the same at any map resolution. [Nate 2026-06-21]
+    if ImageFilter is not None:
+        ov = ov.filter(ImageFilter.GaussianBlur(max(2.0, scale * _cm * 0.8)))
+        ov.putalpha(ov.getchannel("A").point(lambda v: min(200, int(v * 5.0))))
+    # Clip the smoothed coverage to the zone polygons so the blur never bleeds past a
+    # perimeter into the channels/background — coverage shows ONLY over real mowable ground,
+    # giving clean perimeter-aligned edges instead of a slapped-on halo. No-go zones are
+    # punched back out so coverage never shows over them, keeping each zone sharp. [Nate]
+    if clip_polys:
+        clip = Image.new("L", size, 0)
+        cd = ImageDraw.Draw(clip)
+        for poly in clip_polys:
+            if len(poly) >= 3:
+                cd.polygon(poly, fill=255)
+        for poly in (nogo_polys or ()):
+            if len(poly) >= 3:
+                cd.polygon(poly, fill=0)
+        ov = Image.composite(ov, Image.new("RGBA", size, (0, 0, 0, 0)), clip)
+    return ov
+
+
 ORANGE      = (249, 115,  22, 255)
 YELLOW      = (251, 191,  36, 255)
 RED         = (248, 113, 113, 255)
@@ -404,11 +535,11 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
 
     if not drawable:
         draw_text(draw, "No drawable polygons in state", 20, 100, 18, RED)
-        return img.convert("RGB"), dbg
+        return png_bytes(img.convert("RGB")), dbg
 
     if not all_pts:
         draw_text(draw, "Drawable zones exist but points failed to parse", 20, 100, 18, RED)
-        return img.convert("RGB"), dbg
+        return png_bytes(img.convert("RGB")), dbg
 
     dbg.update({"min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y,
                 "canvas_w": W, "canvas_h": H})
@@ -426,7 +557,18 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
     _pc_layer = (data.get("map_layer") or "Coverage") == "Pass Coverage"
     _paths_off = _style in ("Paths Off", "No Coverage")     # "No Coverage" = legacy alias
     _activity_style = _style == "Activity"
+    _zone_age_style = _style == "Zone Age"                   # #2: per-zone mow-age tint
+    _dim_by_age = bool(data.get("dim_by_age"))               # #2: dim stripe styles by age
+    _zone_ages = data.get("zone_last_mowed") or {}           # {zone_key: epoch | None}
+    _mow_interval = float(data.get("mow_interval_days") or DEFAULT_MOW_INTERVAL_DAYS)
+    _now_ts = time.time()
     _flag = set(data.get("flaggable_zone_keys") or [])
+    # Never red-flag a zone that isn't on the CURRENT task list — kills a stale flag lingering
+    # from a finished task (e.g. last task's zone showing red) before the coordinator's next
+    # recompute clears it. Empty task list (between tasks) leaves _flag as-is. [Nate 2026-06-21]
+    _task_keys = set(data.get("cleanZoneIds") or [])
+    if _task_keys:
+        _flag &= _task_keys
     _zstats = data.get("zone_stats") or {}
     _mowed_idx = set()
     if _pc_layer:
@@ -446,6 +588,8 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
         this context-free view just reads as 'something went wrong'. Other styles keep
         the original behaviour (red only on the Pass Coverage layer, paths draw on top)."""
         key = zone.get("hashId") or zone.get("name")
+        if _zone_age_style:
+            return _age_color(_zone_ages.get(key), _now_ts, _mow_interval)
         if _paths_off:
             poly = safe_points(zone.get("points") or [])
             area = polygon_area(poly) if len(poly) >= 3 else 0.0
@@ -462,6 +606,20 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
     _show_zone_labels = _labels in ("Both", "Zone Names")
     _show_nogo_labels = _labels in ("Both", "No-Go Names")
 
+    # No-go bounding boxes (pixel space) — a no-go sitting inside a zone draws its label at
+    # ~the same spot as the parent zone's label and they clash (MasterCATZ). We keep the
+    # no-go label put and nudge the PARENT label clear of the no-go BELOW. [Nate 2026-06-20]
+    _nogo_boxes = []
+    for _z in drawable_nogo:
+        _p = safe_points(_z.get("points") or [])
+        if len(_p) >= 3:
+            _pxy = [(sx(x), sy(y)) for x, y in _p]
+            _xs = [p[0] for p in _pxy]; _ys = [p[1] for p in _pxy]
+            _nogo_boxes.append((min(_xs), min(_ys), max(_xs), max(_ys)))
+
+    # Zone name/age labels are QUEUED here and drawn AFTER the coverage swaths (below), so
+    # persistent coverage paths don't bury them. [Nate 2026-06-21]
+    _zone_label_queue: list = []
     for idx, zone in enumerate(drawable):
         pts = safe_points(zone.get("points") or [])
         if len(pts) > 300:
@@ -474,8 +632,22 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
                 cx = sum(p[0] for p in xy) / len(xy)
                 cy = sum(p[1] for p in xy) / len(xy)
                 label = str(zone.get("name") or zone.get("hashId") or idx)[:16]
-                draw_center(draw, label, cx, cy, 10, WHITE)
-    
+                if _zone_age_style:
+                    # Fold the age INTO the zone label (no second label → doesn't worsen the
+                    # no-go/zone label clash). "Front Right · 5d" / "· new" if never mowed.
+                    _lm = _zone_ages.get(zone.get("hashId") or zone.get("name"))
+                    if _lm:
+                        label = f"{label[:12]} · {int((_now_ts - float(_lm)) / 86400.0)}d"
+                    else:
+                        label = f"{label[:12]} · new"
+                # Place the label so it stays INSIDE the zone (full text width) and clear of
+                # every no-go FILL (always drawn, so this applies in any Map Labels mode) —
+                # fixes labels half-covered by a no-go and labels drifting off an irregular
+                # zone's edge. Falls back to the centroid if nothing fits. [Nate 2026-06-20]
+                lx, lcy = _place_label_xy(cx, cy, xy, len(label) * 6.0, _nogo_boxes)
+                _zone_label_queue.append((label, lx, lcy))   # drawn on top, after coverage
+
+
     # No-go zones / excluded areas — orange overlay
     for idx, zone in enumerate(drawable_nogo):
         pts = safe_points(zone.get("points") or [])
@@ -634,6 +806,20 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
                 _amber, Image.new("RGBA", img.size, (0, 0, 0, 0)), _mask))
 
     style = data.get("coverage_style") or "Green Checker"
+    # PERSISTENT per-zone coverage (#4 retention): draw the stored occupancy masks as the
+    # coverage BASE, age-tinted, BEFORE the live breadcrumb swath. These survive new tasks +
+    # restarts, so previously-mowed zones keep their coverage and a rained-out zone shows only
+    # its partial cells; the live breadcrumb then draws on top for the zone being mowed now.
+    # Coverage layer only, and only for coverage-showing styles (Zone Age / Paths Off / No
+    # Coverage draw their own whole-zone view, so skip the cells there). [Nate 2026-06-21]
+    if map_layer == "Coverage" and style not in ("Paths Off", "No Coverage", "Zone Age"):
+        _clip = [[(sx(x), sy(y)) for x, y in safe_points(z.get("points") or [])]
+                 for z in drawable]
+        _nogo = [[(sx(x), sy(y)) for x, y in safe_points(z.get("points") or [])]
+                 for z in drawable_nogo]
+        img.alpha_composite(_render_persistent_masks(
+            data.get("zone_coverage_history") or {}, _now_ts, _mow_interval,
+            sx, sy, scale, img.size, clip_polys=_clip, nogo_polys=_nogo))
     width = max(3, int(scale * SWATH_DRAW_M))   # SWATH_DRAW_M / CUT_WIDTH_M from map_tuning.py
 
     def _polyline(pts_xy, col, w):
@@ -658,10 +844,10 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             if row.get("kind") == "perimeter":
                 _polyline([(sx(x), sy(y)) for x, y in row["pts"]], col + (255,), width)
 
-    if style in ("Paths Off", "No Coverage"):
-        # Paths Off: no mowed swaths — the zone STATUS fill (drawn above: DONE green /
-        # flagged red / no-data grey) is the whole story. A clean at-a-glance "what got
-        # done, what to check, what we have no data on" view. Legend drawn below.
+    if style in ("Paths Off", "No Coverage", "Zone Age"):
+        # Paths Off / Zone Age: no mowed swaths — the per-zone fill drawn above is the whole
+        # story (Paths Off = DONE/flagged/no-data status; Zone Age = green tint by mow-age).
+        # A clean at-a-glance view; legend drawn below.
         pass
     elif style == "Gradient":
         GAP_M2 = 4.0
@@ -783,9 +969,63 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             # → overlap invisible. _perimeter_ring() also gates on coverage so it never bleeds onto
             # a heatmap layer.
             _perimeter_ring(rows, DARK)
+
+    # Dim-by-age MODIFIER: darken each zone's stripes by mow-age (older = darker/duller),
+    # the stripe pattern stays visible through the veil. Only on the Coverage layer with a
+    # stripe style — NOT the dedicated Zone Age fill, Paths Off, or a heatmap layer. [Nate]
+    if (_dim_by_age and map_layer in ("Coverage", "Pass Coverage")
+            and not _zone_age_style and not _paths_off):
+        veil = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        vdraw = ImageDraw.Draw(veil, "RGBA")
+        drew = False
+        for zone in drawable:
+            a = _dim_alpha(_zone_ages.get(zone.get("hashId") or zone.get("name")),
+                           _now_ts, _mow_interval)
+            if a <= 0:
+                continue
+            pts = safe_points(zone.get("points") or [])
+            if len(pts) > 300:
+                pts = pts[::max(1, math.ceil(len(pts) / 300))]
+            xy = [(sx(x), sy(y)) for x, y in pts]
+            if len(xy) >= 3:
+                vdraw.polygon(xy, fill=_DIM_VEIL + (a,)); drew = True
+        if drew:
+            # Punch the no-go polygons out of the veil so they're NOT dimmed — they stay
+            # clearly orange instead of going brownish in an aged zone. [Nate 2026-06-20]
+            hole = Image.new("L", img.size, 0)
+            hdraw = ImageDraw.Draw(hole)
+            for ngz in drawable_nogo:
+                npts = safe_points(ngz.get("points") or [])
+                if len(npts) > 300:
+                    npts = npts[::max(1, math.ceil(len(npts) / 300))]
+                nxy = [(sx(x), sy(y)) for x, y in npts]
+                if len(nxy) >= 3:
+                    hdraw.polygon(nxy, fill=255)
+            valpha = veil.getchannel("A")
+            valpha.paste(0, mask=hole)        # zero the veil's alpha over every no-go
+            veil.putalpha(valpha)
+            img.alpha_composite(veil)
+        dbg["dim_by_age"] = True
     dbg.update({"coverage_points": len(coverage), "coverage_style": style})
 
+    # Zone name/age labels ON TOP of the coverage swaths (queued during the zone-fill pass),
+    # so held/persistent mow paths never bury the names. [Nate 2026-06-21]
+    for _lbl, _lx, _ly in _zone_label_queue:
+        draw_center(draw, _lbl, _lx, _ly, 10, WHITE)
+
     # (Missed count/total now live in the grey diagnostic header.)
+
+    # Mower/dock/RTK marker sizing. The floor + cap scale with the RESOLUTION (image px) — a
+    # FIXED 84px cap crushed the Map-Mower-Size differences at higher resolution (Medium/Large/
+    # XL all clamped to 84). Now the cap is ~84 at 800px and grows with the image, so the size
+    # select stays meaningful at any resolution. Dock/RTK render a bit smaller than the mower.
+    # [Nate 2026-06-21]
+    _mk_mult = MOWER_SIZE_MULT.get(data.get("mower_size") or MOWER_SIZE_DEFAULT,
+                                   MOWER_SIZE_MULT[MOWER_SIZE_DEFAULT])
+    _px_floor = max(12, round(min(W, H) * 0.02))            # findable on huge yards / 4K
+    _px_cap = max(_px_floor + 1, round(min(W, H) * 0.105))  # ~84 at 800px, scales with resolution
+    mower_icon_px = max(_px_floor, min(_px_cap, round(scale * CUT_WIDTH_M * _mk_mult)))
+    marker_px = max(10, round(mower_icon_px * 0.72))        # dock/RTK a touch smaller than the mower
 
     # Prefer the mower-reported dock; fall back to the derived one (captured from its pose
     # while charging) so the dock marker persists even when chargingStationLoc drops out.
@@ -803,26 +1043,31 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
         dx, dy = sx(x), sy(y)
         # Charging-dock glyph: rounded plate + lightning bolt. Drawn BEFORE the robot
         # so the mower marker always sits on top and stays visible while docked.
-        s = 11
-        draw.rounded_rectangle((dx - s, dy - s, dx + s, dy + s), radius=4,
-                               fill=(45, 55, 72, 255), outline=YELLOW, width=3)
-        draw.polygon([(dx + 3, dy - s + 4), (dx - 5, dy + 1), (dx, dy + 1),
-                      (dx - 3, dy + s - 4), (dx + 6, dy - 2), (dx, dy - 2)], fill=YELLOW)
+        # Scaled by g (glyph was tuned at ~22px) so it matches the mower icon size. [Nate]
+        g = marker_px / 22.0
+        s = max(8, round(11 * g))
+        draw.rounded_rectangle((dx - s, dy - s, dx + s, dy + s), radius=max(3, round(4 * g)),
+                               fill=(45, 55, 72, 255), outline=YELLOW, width=max(2, round(3 * g)))
+        draw.polygon([(dx + 3 * g, dy - s + 4 * g), (dx - 5 * g, dy + 1 * g), (dx, dy + 1 * g),
+                      (dx - 3 * g, dy + s - 4 * g), (dx + 6 * g, dy - 2 * g), (dx, dy - 2 * g)],
+                     fill=YELLOW)
 
 
     # RTK base antenna — physically at the ENU origin (0,0), the survey datum.
     # Drawn as a cyan diamond (distinct shape vs the round dock/robot pins) so it
     # reads as a fixed reference rather than a movable unit.
     ax, ay = sx(0.0), sy(0.0)
-    if -13 <= ax <= W + 13 and HEADER_H - 13 <= ay <= H - FOOTER_H + 13:
+    _g = marker_px / 22.0                     # scale RTK glyph with the mower icon [Nate]
+    _m = max(13, round(13 * _g))
+    if -_m <= ax <= W + _m and HEADER_H - _m <= ay <= H - FOOTER_H + _m:
         # Survey-benchmark glyph: cyan triangle + center dot. The RTK base is the
         # fixed survey datum (the ENU origin everything is referenced to), so a
         # benchmark marker reads truer than a "broadcasting" antenna.
         draw.polygon(
-            [(ax, ay - 11), (ax + 10, ay + 8), (ax - 10, ay + 8)],
-            outline=CYAN, width=3,
+            [(ax, ay - 11 * _g), (ax + 10 * _g, ay + 8 * _g), (ax - 10 * _g, ay + 8 * _g)],
+            outline=CYAN, width=max(2, round(3 * _g)),
         )
-        draw.ellipse((ax - 2, ay - 1, ax + 2, ay + 3), fill=CYAN)
+        draw.ellipse((ax - 2 * _g, ay - 1 * _g, ax + 2 * _g, ay + 3 * _g), fill=CYAN)
 
     # Obstacles — a thing the mower routed around. HOLLOW amber hazard triangle sized to
     # the footprint: reads as "caution, physical object" AND stays see-through so the
@@ -848,6 +1093,12 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
     # Dwell / stuck anomalies (#5). Marker per class: SPIN (crop-circle) = magenta spiral;
     # STRUGGLE (thrashed in place) = red burst; EXCESS-TURN (> half turn) = amber partial spiral;
     # PAUSED (E-stop / RTK lock — stationary) = muted grey pause bars.
+    # Markers scale with map resolution (were fixed-px, too small to spot at Large/4K). [Nate]
+    _am = max(1.0, min(4.0, scale / 12.0))      # 1× at Standard, up to 4× at 4K
+    _aw = max(2, round(2 * _am))                 # stroke width
+    _af = max(9, round(9 * _am))                 # label font px
+    def _ar(r):
+        return r * _am                           # scaled radius/offset
     for ev in (data.get("anomaly_events") or []):
         ac = ev.get("center")
         if not ac:
@@ -859,36 +1110,36 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
         _kind = ev.get("kind")
         if _kind == "spin":
             acol = (235, 60, 140, 255)
-            for _k, _r in enumerate((5, 9, 13)):
+            for _k, _r in enumerate((_ar(5), _ar(9), _ar(13))):
                 draw.arc((ax - _r, ay - _r, ax + _r, ay + _r), 30 + _k * 100, 30 + _k * 100 + 250,
-                         fill=acol, width=2)
-            draw_center(draw, "spin", ax, ay + 17, 9, acol)
+                         fill=acol, width=_aw)
+            draw_center(draw, "spin", ax, ay + _ar(17), _af, acol)
         elif _kind == "struggle":
             acol = (245, 170, 30, 255)                      # amber/yellow BURST (moderate, 2-4 m)
             for _deg in range(0, 360, 45):
                 _r = math.radians(_deg)
-                draw.line((ax + 4 * math.cos(_r), ay + 4 * math.sin(_r),
-                           ax + 13 * math.cos(_r), ay + 13 * math.sin(_r)), fill=acol, width=2)
-            draw.ellipse((ax - 3, ay - 3, ax + 3, ay + 3), fill=acol)
-            draw_center(draw, "struggle", ax, ay + 17, 9, acol)
+                draw.line((ax + _ar(4) * math.cos(_r), ay + _ar(4) * math.sin(_r),
+                           ax + _ar(13) * math.cos(_r), ay + _ar(13) * math.sin(_r)), fill=acol, width=_aw)
+            draw.ellipse((ax - _ar(3), ay - _ar(3), ax + _ar(3), ay + _ar(3)), fill=acol)
+            draw_center(draw, "struggle", ax, ay + _ar(17), _af, acol)
         elif _kind == "excess-turn":
             acol = (245, 170, 30, 255)                      # amber partial spiral
-            draw.arc((ax - 11, ay - 11, ax + 11, ay + 11), 30, 300, fill=acol, width=2)
-            draw.arc((ax - 6, ay - 6, ax + 6, ay + 6), 60, 250, fill=acol, width=2)
-            draw_center(draw, "excess turn", ax, ay + 17, 9, acol)
+            draw.arc((ax - _ar(11), ay - _ar(11), ax + _ar(11), ay + _ar(11)), 30, 300, fill=acol, width=_aw)
+            draw.arc((ax - _ar(6), ay - _ar(6), ax + _ar(6), ay + _ar(6)), 60, 250, fill=acol, width=_aw)
+            draw_center(draw, "excess turn", ax, ay + _ar(17), _af, acol)
         elif _kind == "jitter":
             acol = (235, 70, 60, 255)                       # RED burst, bigger/denser = heavy wear (>= 4 m)
             for _deg in range(0, 360, 30):
                 _r = math.radians(_deg)
-                draw.line((ax + 4 * math.cos(_r), ay + 4 * math.sin(_r),
-                           ax + 16 * math.cos(_r), ay + 16 * math.sin(_r)), fill=acol, width=2)
-            draw.ellipse((ax - 4, ay - 4, ax + 4, ay + 4), fill=acol)
-            draw_center(draw, "jitter", ax, ay + 19, 9, acol)
+                draw.line((ax + _ar(4) * math.cos(_r), ay + _ar(4) * math.sin(_r),
+                           ax + _ar(16) * math.cos(_r), ay + _ar(16) * math.sin(_r)), fill=acol, width=_aw)
+            draw.ellipse((ax - _ar(4), ay - _ar(4), ax + _ar(4), ay + _ar(4)), fill=acol)
+            draw_center(draw, "jitter", ax, ay + _ar(19), _af, acol)
         else:                                                # paused (info)
             acol = (150, 156, 165, 255)
-            draw.rectangle((ax - 5, ay - 7, ax - 2, ay + 7), fill=acol)
-            draw.rectangle((ax + 2, ay - 7, ax + 5, ay + 7), fill=acol)
-            draw_center(draw, "paused", ax, ay + 16, 9, acol)
+            draw.rectangle((ax - _ar(5), ay - _ar(7), ax - _ar(2), ay + _ar(7)), fill=acol)
+            draw.rectangle((ax + _ar(2), ay - _ar(7), ax + _ar(5), ay + _ar(7)), fill=acol)
+            draw_center(draw, "paused", ax, ay + _ar(16), _af, acol)
     dbg.update({"anomaly_events": len(data.get("anomaly_events") or [])})
 
     # Pass Coverage layer: dashed rings on under-/un-mowed spots. RED = MISSED (no swath laid —
@@ -973,14 +1224,10 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             frame = Image.new("RGBA", (diag, diag), (0, 0, 0, 0))
             frame.alpha_composite(rot, ((diag - rot.width) // 2, (diag - rot.height) // 2))
             icon = frame
-            # Mower marker size is anchored to the REAL swath (16 in), not fixed pixels, so it
-            # scales with the yard (small yards → bigger marker, large yards → smaller). The
-            # MULT comes from the user's "Map Mower Size" select (a true-scale mower ~11px here
-            # is too tiny to read), with a floor/cap so it stays findable on huge yards and sane
-            # on tiny ones.
-            MOWER_SWATH_MULT = MOWER_SIZE_MULT.get(
-                data.get("mower_size") or MOWER_SIZE_DEFAULT, MOWER_SIZE_MULT[MOWER_SIZE_DEFAULT])
-            mower_px = max(16, min(84, round(scale * CUT_WIDTH_M * MOWER_SWATH_MULT)))
+            # Mower marker size = the shared, resolution-aware mower_icon_px computed above
+            # (anchored to the real swath × the Map-Mower-Size mult, floor/cap scaled to the
+            # image so the size select stays meaningful at any resolution). [Nate 2026-06-21]
+            mower_px = mower_icon_px
             icon.thumbnail((mower_px, mower_px), Image.LANCZOS)
             dbg["mower_px"] = mower_px
             # Headlight BEAMS: the icon's bulbs vanish at map scale, so when lit, project two
@@ -1119,7 +1366,7 @@ def build_map_png(data: dict, imperial: bool = False, device_name: str = "Lymow"
             draw_text(draw, _lab, _tx, _yy - 7, 12, WHITE)
         _cx += _colws[_c]
 
-    return img.convert("RGB"), dbg
+    return png_bytes(img.convert("RGB")), dbg
 
 
 def text_png(title: str, subtitle: str) -> bytes:

@@ -25,8 +25,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import multiprocessing
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any
 import re
 
@@ -103,6 +105,7 @@ from .state import (
     _localization_active,
     derive_current_zone,
     derive_current_channel,
+    resolve_location,
     get_enu_base_point,
     get_robot_pose,
     merge_pboutput,
@@ -119,8 +122,14 @@ from .path_engine import classify_segments, CutAccumulator, BreadcrumbAccumulato
 from .obstacles import detect_obstacles
 from .pass_coverage import analyze_pass_coverage
 from .zone_stats import assign_to_zones, point_in_polygon
+from .coverage_worker import compute_coverage
+from .zone_coverage import ZoneCoverageHistory, cells_for_points
 
 _LOGGER = logging.getLogger(__name__)
+
+# Sustained seconds the mower must resolve to Off-Map (in no zone, no channel, while active)
+# before we declare a geofence breach — guards against GPS jitter blipping at a boundary.
+LOCATION_OFFMAP_DEBOUNCE_S = 8.0
 
 _REST_POLL_INTERVAL = timedelta(minutes=15)
 _REFRESH_INTERVAL   = 30          # seconds — periodic config/net/RTK refresh
@@ -208,17 +217,36 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return {_ZH_REMAP.get(k, k): vv for k, vv in v.items() if k not in _ZH_DROP}
         _items = list((self._state.get("zone_history") or {}).items())
         _zh_mig, _by_name = {}, {}
+        _n_canon = _n_folded = _n_kept = 0
         for _k, _v in _items:                       # pass 1: canonical hashId-keyed records
             if isinstance(_v, dict) and _v.get("zone_id"):
                 _zh_mig[_k] = _zh_remap(_v)
                 _by_name[_zh_mig[_k].get("zone_name")] = _k
+                _n_canon += 1
         for _k, _v in _items:                       # pass 2: fold legacy name-keyed halves in
             if isinstance(_v, dict) and not _v.get("zone_id"):
                 _tgt = _by_name.get(_k)             # legacy key WAS the zone name
                 if _tgt:
                     for _kk, _vv in _zh_remap(_v).items():
                         _zh_mig[_tgt].setdefault(_kk, _vv)
+                    _n_folded += 1
+                elif _k not in _zh_mig:
+                    # No canonical hashId record to fold into. KEEP it rather than drop it —
+                    # never lose a user's history on an older/unforeseen format. It stays under
+                    # its original key (hashId-keyed entities won't surface it, but the data is
+                    # preserved + persisted + recoverable). [hardening 2026-06-22]
+                    _zh_mig[_k] = _zh_remap(_v)
+                    _n_kept += 1
         self._state["zone_history"] = _zh_mig
+        if _n_kept:
+            _LOGGER.warning(
+                "zone_history migration preserved %d legacy record(s) with no canonical "
+                "hashId match (kept, NOT dropped) — %d canonical, %d folded. If zone history "
+                "looks wrong after upgrade, please report with this log.",
+                _n_kept, _n_canon, _n_folded)
+        elif _items:
+            _LOGGER.debug("zone_history migration: %d canonical, %d legacy folded",
+                          _n_canon, _n_folded)
         # Derived dock location (captured from the mower's pose while charging) — restored
         # so the dock marker is present immediately, even before the mower reports it.
         if config_entry and config_entry.data.get("derived_dock"):
@@ -256,6 +284,14 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Session-scoped annotations (deviations + obstacle events) persisted so a
         # reload keeps them until a NEW task starts (then cleared).
         self._annot_store = Store(self.hass, 1, f"lymow_annot_{thing_name}")
+        # PERSISTENT per-zone coverage masks (zone_coverage.py). Unlike the cut/breadcrumb
+        # tracks above (per-session, reset on a new task), these survive restarts AND new
+        # tasks: each zone keeps its last mow on the map until that zone is itself re-mowed
+        # (copy-on-write). Bounded by zone AREA, not mow time — a half-acre yard ≈ tens of KB.
+        self._zone_coverage = ZoneCoverageHistory()
+        self._zonecov_store = Store(self.hass, 1, f"lymow_zonecov_{thing_name}")
+        self._zonecov_save_counter = 0
+        self._offmap_since: float | None = None   # debounce timer for the Off-Map geofence breach
         self._mow_session_key: int = 0
         self._was_active: bool = False
         self._breadcrumb_save_counter = 0
@@ -300,6 +336,12 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._perim_stable: int = 0
         self._perim_prev: int = 0
         self._obstacle_scan: int = 0   # throttle counter for coverage-hole obstacle scans
+        # Heavy coverage attribution is GIL-bound pure Python that blocks HA's loop
+        # 0.5–1.8s/tick on a large lawn (see bench.py). Offload it to a spawn subprocess.
+        # Single-flight: never queue a second compute while one is running. Gated by the
+        # render_multiprocessing option. [eve]
+        self._cov_executor = None          # ProcessPoolExecutor | None (lazy, in async_setup)
+        self._cov_inflight: bool = False
         self._pass_cov_bootstrapped: bool = False  # one-shot pass-coverage compute on startup
         # Zone-visit accumulator (this mow): per-zone mow-ONLY seconds + battery, plus
         # session travel time. Time accrues only while actively mowing inside a real zone,
@@ -352,6 +394,35 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._state["obstacle_events"] = annot["obstacle_events"]
         except Exception:
             _LOGGER.debug("No saved annotations for %s", self.thing_name)
+        # Restore the persistent per-zone coverage masks so every zone's last mow is
+        # on the map immediately after a restart / HACS reload (the whole point of #4).
+        try:
+            self._zone_coverage.load_dict(await self._zonecov_store.async_load())
+            # Seed/refresh last_mowed from the mower's per-zone history — but ONLY from genuine
+            # COMPLETED mows. zone_history stamps last_mowed even on a rained-out / cancelled run
+            # (end_type != "completed"), so gating on completed keeps that rain-out timestamp from
+            # leaking in and falsely marking a zone "mowed" on the next restart. seed_last_mowed
+            # only ADVANCES (monotonic), and the enu_base fix means a zone now keeps its own
+            # completion-gated date across reconciles — so this is bootstrap, never a regression.
+            _seed = {}
+            for _zid, _h in (self._state.get("zone_history") or {}).items():
+                if _h.get("end_type") == "completed" and _h.get("last_mowed"):
+                    try:
+                        _seed[_zid] = {
+                            "last_mowed": datetime.fromisoformat(_h["last_mowed"]).timestamp(),
+                            "name": _h.get("zone_name"),
+                        }
+                    except (TypeError, ValueError):
+                        pass
+            if self._zone_coverage.seed_last_mowed(_seed):
+                self.hass.async_create_task(
+                    self._zonecov_store.async_save(self._zone_coverage.to_dict()))
+            self._state["zone_coverage_history"] = self._zone_coverage.render_masks()
+            self._state["zone_last_mowed"] = self._zone_coverage.last_mowed_map()
+            self._state["mow_interval_days"] = self._zone_coverage.mow_interval_days
+            self._state["dim_by_age"] = self._zone_coverage.dim_by_age
+        except Exception:
+            _LOGGER.debug("No saved per-zone coverage for %s", self.thing_name)
         self._was_active = _localization_active(self._state)
         await self.auth.ensure_valid(self._email, self._password)
 
@@ -370,6 +441,20 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._path_refresh_loop(),
             name=f"lymow_path_refresh_{self.thing_name}",
         )
+        # Spawn the coverage-compute subprocess (one worker; spawn, not fork — fork is
+        # unsafe alongside asyncio/threads). Gated by the render_multiprocessing option.
+        use_mp = True
+        if self._config_entry is not None:
+            use_mp = self._config_entry.options.get("render_multiprocessing", True)
+        if use_mp and self._cov_executor is None:
+            try:
+                self._cov_executor = ProcessPoolExecutor(
+                    max_workers=1, mp_context=multiprocessing.get_context("spawn")
+                )
+            except Exception:
+                _LOGGER.warning("Could not start coverage subprocess for %s — running inline",
+                                self.thing_name, exc_info=True)
+                self._cov_executor = None
 
     async def async_shutdown(self) -> None:
         """Disconnect MQTT and cancel all background tasks."""
@@ -393,6 +478,9 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.mqtt:
             await self.mqtt.disconnect()
             self.mqtt = None
+        if self._cov_executor is not None:
+            self._cov_executor.shutdown(wait=False)
+            self._cov_executor = None
 
     async def _connect_mqtt(self) -> None:
         """Create and connect a new MqttClient with current credentials."""
@@ -606,33 +694,34 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             or self._state.get("workStatus") in (WORK_STATUS_CHARGING, WORK_STATUS_CHARGING_FULL)
             or bool(self._state.get("isCharging"))
         )
-        if _docked:
-            # Parked on the dock — give the sensors a meaningful state instead of unknown.
-            self._state["currentZone"] = "Docked"
-            self._state["currentChannel"] = "None"
-            self._state["currentChannelInfo"] = None
-        elif _localization_active(self._state) and robot_gps_from_state(self._state) and get_enu_base_point(self._state):
-            # Zone WINS over channel: while the mower's position is inside any zone
-            # (incl. an overlap held sticky), it is mowing that zone — the channel
-            # buffer must NOT trigger a transit. Only once the mower is outside every
-            # zone (derive_current_zone -> None) do we consult the channel. This is
-            # the same exclusive-area principle as the zone-overlap handling.
-            zone = derive_current_zone(self._state)
-            if zone:
-                self._state["currentZone"] = zone
-                self._state["currentChannel"] = None  # in a zone → not in a channel (unknown, not "Clear")
-                self._state["currentChannelInfo"] = None
+        # Single source of truth: resolve WHERE the mower is once (No-Go > Zone > Channel >
+        # Off-Map), then Location State + Current Zone + Current Channel all read from it so
+        # they can never disagree (which was the unknown-flicker bug). Off-Map (in no zone,
+        # no channel, while active) = the negative-space geofence breach — DEBOUNCED so GPS
+        # jitter at a boundary can't blip a false breach.
+        _loc = resolve_location(self._state, _docked)
+        if _loc is not None:
+            _label, _zone, _chan, _chan_info = _loc
+            if _label == "Off-Map":
+                now = time.monotonic()
+                if self._offmap_since is None:
+                    self._offmap_since = now
+                if now - self._offmap_since >= LOCATION_OFFMAP_DEBOUNCE_S:
+                    self._state["locationState"] = _label
+                    self._state["currentZone"] = _zone
+                    self._state["currentChannel"] = _chan
+                    self._state["currentChannelInfo"] = _chan_info
+                # else: within the debounce window — HOLD previous (don't commit a breach yet)
             else:
-                channel = derive_current_channel(self._state)
-                if channel:
-                    self._state["currentChannel"] = channel.get("label")
-                    self._state["currentChannelInfo"] = channel
-                    self._state["currentZone"] = None  # in a channel → not in a zone (unknown, not "Clear")
-                # else: outside every zone AND channel — unknown. Keep the previous
-                # value (a single partial/edge frame shouldn't blank it); the zone-edge
-                # buffer above already prevents most perimeter-lap dropouts.
-        # else: paused / error / idle / partial frame — keep previous (sticky).
-        # Docking (returning) IS localization-active, so it re-derives above even
+                self._offmap_since = None
+                self._state["locationState"] = _label
+                self._state["currentZone"] = _zone
+                self._state["currentChannel"] = _chan
+                self._state["currentChannelInfo"] = _chan_info
+        else:
+            # paused / idle / partial / no-fix — keep previous (sticky); not an active breach.
+            self._offmap_since = None
+        # Docking (returning) IS localization-active, so it re-resolves above even
         # after a cleanReport reset currentZone=None on task cancel.
 
 
@@ -647,6 +736,32 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _dict_or_empty(self, value):
         return value if isinstance(value, dict) else {}
+
+    def _apply_coverage_results(self, zones, zone_stats, obstacle_events, pcov, do_obstacle) -> None:
+        """Apply heavy-attribution results to state (runs on the loop). Mirrors the original
+        inline tail: set zone_stats, then on an obstacle tick filter flags to flaggable zones."""
+        if zone_stats is not None:
+            self._state["zone_stats"] = zone_stats
+        if do_obstacle:
+            _obs2, pcov2 = self._filter_to_flaggable(
+                obstacle_events, pcov, zones, self._state.get("zone_stats"))
+            self._state["obstacle_events"] = _obs2
+            if pcov2:
+                self._state["pass_coverage"] = pcov2
+
+    async def _async_compute_coverage(self, zones, gz, ng, xy, bp_xy, do_obstacle) -> None:
+        """Run the heavy attribution in the subprocess, then apply results on the loop.
+        Single-flight (see _cov_inflight) so a slow compute can't queue up behind itself."""
+        try:
+            loop = asyncio.get_running_loop()
+            zone_stats, obstacle_events, pcov = await loop.run_in_executor(
+                self._cov_executor, compute_coverage, zones, gz, ng, xy, bp_xy, do_obstacle)
+            self._apply_coverage_results(zones, zone_stats, obstacle_events, pcov, do_obstacle)
+            self.async_set_updated_data(self._state)
+        except Exception:
+            _LOGGER.debug("offloaded coverage compute failed for %s", self.thing_name, exc_info=True)
+        finally:
+            self._cov_inflight = False
 
     def _handle_pboutput(self, raw_envelope: bytes) -> None:
         """Decode one MQTT /pboutput packet and merge it into coordinator state.
@@ -744,6 +859,10 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._state["zone_catalog"] = catalog
                         self._state["btMap"] = catalog.to_btmap_dict()
                         self._state["backupMapDownloadError"] = None
+                        # #4: now that we have an AUTHORITATIVE full zone list, reconcile the
+                        # persistent coverage masks (drop deleted zones / invalidate on RTK
+                        # base relocation). Safe here — never on a partial telemetry frame.
+                        self._reconcile_zone_coverage_map()
                         # One-shot: zones are now available and the breadcrumb trail was
                         # restored at setup, so compute pass-coverage once — the Double
                         # Coverage sensor / Pass Coverage layer then populate from the LAST
@@ -915,45 +1034,39 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                  and "x" in p and "y" in p]
                         btm = self._state.get("btMap") or {}
                         zones = btm.get("zones") or []
-                        # Per-zone coverage attribution (point-in-polygon) from the pose-trail.
-                        if zones and xy:
-                            self._state["zone_stats"] = assign_to_zones(zones, xy, [])
-                        # OBSTACLE detection (plan-free): an un-mowed island surrounded by
-                        # mowed area inside a go-zone (and not explained by a no-go) = a thing
-                        # the mower routed around. Replaces the old plan-vs-actual deviation
-                        # method (we never get a planned route). Throttled — it rasterises the
-                        # zones — and gated on enough coverage to be meaningful.
+                        # #4: maintain the PERSISTENT per-zone coverage masks (clear+rebuild a
+                        # zone only when it's on the task list AND the actively-mowed zone).
+                        # Stateful (mask lives on self._zone_coverage) → stays on-loop; it's
+                        # incremental and cheap relative to the attribution below.
+                        self._update_zone_coverage(zones, xy)
+                        # HEAVY attribution: per-zone point-in-polygon (assign_to_zones) plus the
+                        # throttled, zone-rasterising obstacle/pass-coverage scan. On a large lawn
+                        # this is 0.5–1.8s of GIL-bound pure Python (see bench.py), so it's run in
+                        # a subprocess to keep HA's event loop responsive. Single-flight: skip a
+                        # tick rather than queue a second compute. Inline fallback when the
+                        # subprocess is disabled/unavailable (preserves original behavior). [eve]
                         self._obstacle_scan += 1
-                        if len(xy) >= 200 and self._obstacle_scan % 12 == 0:
-                            try:
-                                def _poly(z):
-                                    return [((p.get("x"), p.get("y")) if isinstance(p, dict) else (p[0], p[1]))
-                                            for p in (z.get("points") or [])]
-                                gz = [{"name": z.get("name"), "polygon": _poly(z),
-                                       "double": (z.get("zoneConfig") or {}).get("cleanMode") == 3}
-                                      for z in zones if z.get("points")]
-                                ng = [_poly(z) for z in (btm.get("nogoZones") or []) if z.get("points")]
-                                self._state["obstacle_events"] = detect_obstacles(gz, ng, xy, lowconf=bp_xy)
-                                # Double-coverage / single-pass + MISSED analysis. single-pass
-                                # (got one of two passes) is only a defect in CHESS/double zones,
-                                # so pass which zones are double (cleanMode==3); MISSED (un-mowed)
-                                # is flagged in ALL mowed zones, single or double.
-                                pcov = analyze_pass_coverage(
-                                    xy, [z["polygon"] for z in gz], ng,
-                                    obstacles=self._state.get("obstacle_events"),
-                                    double_polys=[z["polygon"] for z in gz if z["double"]])
-                                # Keep flags ONLY in zones that are on the task list AND finished
-                                # AND not currently being mowed — so a zone's not-yet-reached ground
-                                # (in progress / left for a recharge) and merely-transited zones don't
-                                # throw false obstacle/missed/single flags.
-                                _obs2, pcov = self._filter_to_flaggable(
-                                    self._state.get("obstacle_events"), pcov, zones,
-                                    self._state.get("zone_stats"))
-                                self._state["obstacle_events"] = _obs2
-                                if pcov:
-                                    self._state["pass_coverage"] = pcov
-                            except Exception:
-                                _LOGGER.debug("obstacle/pass scan failed for %s", self.thing_name, exc_info=True)
+                        do_obstacle = len(xy) >= 200 and self._obstacle_scan % 12 == 0
+                        if zones and xy:
+                            def _poly(z):
+                                return [((p.get("x"), p.get("y")) if isinstance(p, dict) else (p[0], p[1]))
+                                        for p in (z.get("points") or [])]
+                            gz = [{"name": z.get("name"), "polygon": _poly(z),
+                                   "double": (z.get("zoneConfig") or {}).get("cleanMode") == 3}
+                                  for z in zones if z.get("points")]
+                            ng = [_poly(z) for z in (btm.get("nogoZones") or []) if z.get("points")]
+                            if self._cov_executor is not None:
+                                if not self._cov_inflight:
+                                    self._cov_inflight = True
+                                    self.hass.async_create_task(
+                                        self._async_compute_coverage(zones, gz, ng, xy, bp_xy, do_obstacle))
+                                # else: a compute is still running — skip; next tick catches up.
+                            else:
+                                try:
+                                    _zs, _ob, _pc = compute_coverage(zones, gz, ng, xy, bp_xy, do_obstacle)
+                                    self._apply_coverage_results(zones, _zs, _ob, _pc, do_obstacle)
+                                except Exception:
+                                    _LOGGER.debug("inline coverage compute failed for %s", self.thing_name, exc_info=True)
                         obstacle_events = self._state.get("obstacle_events") or []
                         self._state["planned_path_segments"] = planned_segs
                         self._state["coverage_track"] = coverage_track
@@ -1134,7 +1247,6 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         h.update({
                             "zone_id": str(zone_id),
                             "zone_name": zone_name or str(zone_id),
-                            "last_mowed": event_data["start_time"],
                             "end_type": event_data["end_type"],
                             "mowing_minutes": event_data["duration_s"],   # cloud cleanTime (minutes, session total)
                             "session_area_m2": event_data["area_m2"],     # cloud cleanArea (SESSION total, all zones, incl. overlap)
@@ -1142,12 +1254,29 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             "session_zone_count": num_zones,
                             "per_zone_stats_available": False,
                         })
+                        # last_mowed + the lifetime mow_count are stamped ONLY when the task
+                        # actually COMPLETED (mowEndType==1) — exactly like the coverage-mask
+                        # snapshot below. A cancelled/rained task records the attempt (end_type +
+                        # session stats) but the zone stays "due". This is the single, completion-
+                        # gated owner of last_mowed/count; the breadcrumb half only enriches stats
+                        # and must never stamp them. [Nate: only task-list zones AND only when each
+                        # completed — don't falsely flag transited/unfinished zones]
+                        if report.mowEndType == 1:
+                            h["last_mowed"] = event_data["start_time"]
+                            h["mow_count"] = (h.get("mow_count") or 0) + 1
                         zone_history[str(zone_id)] = h
 
                     self._state["lastCleanReport"] = report
                     self._state["lastCleanReportTs"] = report_ts
                     self._state["lastSessionEvent"] = event_data
                     self._state["lastSessionEventId"] = report_ts
+                    # #4: authoritative per-zone coverage capture + last_mowed stamp.
+                    # mowEndType: 1=completed (stamp), 2=cancelled / 0=unknown (keep mask,
+                    # don't advance timestamp → zone stays "due").
+                    self._snapshot_report_zones(
+                        event_data["zones"],
+                        completed=(report.mowEndType == 1),
+                        ts=report_ts)
 
                     _LOGGER.info(
                         "Lymow session completed for %s: area=%s time=%s end_type=%s",
@@ -1545,16 +1674,26 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         spacings = {z.get("name"): (z.get("zoneConfig") or {}).get("pathSpacing")
                     for z in zones if z.get("points")}
         changed = False
+        # Only record zones ON THE ACTIVE TASK (cleanZoneIds). Driving THROUGH a zone to reach
+        # the task zone racks up >30 transit points and was being falsely recorded as a mow —
+        # e.g. mow Front Left Strip, but the transit bumps Front Left Main + Backyard
+        # (last_mowed, mow_count). Matches the coverage-mask transit-proofing. Empty/unknown
+        # task list → fall back to coverage-only. [Nate caught this 2026-06-22]
+        task_ids = set(self._state.get("cleanZoneIds") or [])
         for zid, s in stats.items():   # zid = zone hashId — SAME key the cloud writer uses,
             cov = s.get("coverage_points", 0)   # so the two halves merge into one record
             if cov < 30:   # ignore trivial coverage (transit through a zone)
                 continue
+            if task_ids and zid not in task_ids:
+                continue   # only transited this zone to reach the task — not a mow of it
             name = s.get("name") or zid
             h = dict(hist.get(zid) or {})
             h["zone_id"] = zid
             h["zone_name"] = name
-            h["last_mowed"] = now.isoformat()
-            h["mow_count"] = (h.get("mow_count") or 0) + 1   # LIFETIME count (only accumulator)
+            # last_mowed + mow_count are owned by the cloud half (cleanReport), gated on
+            # completion (mowEndType==1). This half ONLY enriches the per-zone stats below —
+            # it must NEVER stamp last_mowed/count, else a transited or unfinished zone would be
+            # falsely recorded as mowed. [Nate 2026-06-22]
             # PER-SESSION metrics (match the last_mowed timestamp; lifetime = mow_count only):
             # session_minutes = THIS mow's wall-clock undock→dock (incl. travel), distinct from
             # mowing_minutes (cloud blade-down session total) merged in by the cleanReport half.
@@ -1564,8 +1703,11 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 h["zone_area_m2"] = areas[name]   # geometric zone area
             _sp = spacings.get(name)
             if _sp:
+                # Expose BOTH units so metric users aren't stuck reading inches. pathSpacing is
+                # native cm; path_spacing_in kept for back-compat (existing dashboards). [Nate]
+                h["path_spacing_cm"] = round(_sp, 1)
                 h["path_spacing_in"] = round(_sp / 2.54, 1)              # cm -> in
-                h["cut_overlap_pct"] = round(100.0 * (40.64 - _sp) / 40.64)  # vs 16 in cut
+                h["cut_overlap_pct"] = round(100.0 * (40.64 - _sp) / 40.64)  # vs 16 in cut (unit-agnostic %)
             # area_covered_m2 = THIS zone's real mowed footprint (rasterised pose-trail), NOT
             # the cloud session total (which the cleanReport half now stores as session_area_m2).
             if s.get("covered_m2") is not None:
@@ -1620,11 +1762,20 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             area = polygon_area(poly)
             if area <= 0:
                 continue
-            total += area
+            # Chess / double-pass zones (zoneConfig.cleanMode == 3) need TWO crosshatch passes,
+            # so they count as 2x the work — otherwise progress hits 100% after the first pass.
+            passes = 2 if (z.get("zoneConfig") or {}).get("cleanMode") == 3 else 1
+            total += area * passes
             covered += min((zstats.get(z.get("hashId")) or {}).get("covered_m2") or 0.0, area)
         if total <= 0:
             return                                         # no geometry/coverage yet -> hold
-        pct = int(round(covered / total * 100))
+        # Add the double-covered area (the 2nd pass): double_pct = fraction of the mowed area
+        # covered twice (pass-coverage analysis). So a double-pass zone reads ~50% at
+        # first-pass-done, then climbs to 100% as the crosshatch fills in. Single-pass tasks
+        # have ~0 double coverage, so this is a no-op for them.
+        double_frac = ((self._state.get("pass_coverage") or {}).get("double_pct") or 0.0) / 100.0
+        covered_work = covered * (1.0 + double_frac)
+        pct = int(round(min(covered_work, total) / total * 100))
         prev = getattr(self, "_prog_display", None)
         if prev is None:
             prev = self._state.get("session_percent_display") or 0
@@ -1641,6 +1792,109 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # give-up rings show immediately instead of waiting for a live mow.
         if key == "map_layer" and value == "Pass Coverage":
             self.hass.async_create_task(self.async_refresh_pass_coverage())
+
+    def _update_zone_coverage(self, zones: list, xy: list) -> None:
+        """#4: maintain the persistent per-zone coverage masks during a mow.
+
+        A zone goes 'live' (old mask cleared copy-on-write, then rebuilt from this
+        session) ONLY when it is on the task list (cleanZoneIds) AND is the actively-mowed
+        current zone — so transiting an unselected zone never wipes it. Zones not mowed
+        this session keep their stored mask. The authoritative final capture + last_mowed
+        stamp happens at cleanReport (_snapshot_report_zones)."""
+        if not zones:
+            return
+        enu_base = self._state.get("enu_base_point")
+        # NOTE: map reconciliation (drop deleted zones / invalidate on base relocation) is
+        # done at the authoritative catalog parse (_reconcile_zone_coverage_map), NOT here —
+        # a transiently partial telemetry frame must never delete a good mask.
+        self._zone_coverage.begin_session(self._mow_session_key)
+
+        # The actively-mowed zone (sticky current zone) that's on a KNOWN task list → live.
+        cur = self._state.get("currentZone")
+        cur = cur if (cur and cur not in ("Docked", "None")) else None
+        task_ids = set(self._state.get("cleanZoneIds") or [])
+        if cur and task_ids:                       # require a known task list (transit-safe)
+            for z in zones:
+                if z.get("name") == cur and z.get("points") and z.get("hashId") in task_ids:
+                    self._zone_coverage.note_active(
+                        z.get("hashId") or z.get("name"), z.get("name"),
+                        self._mow_session_key, enu_base)
+                    break
+
+        # Rebuild live zones' masks from the current breadcrumb trail.
+        live = self._zone_coverage.live
+        if live and xy:
+            cells_by_key = {}
+            for z in zones:
+                key = z.get("hashId") or z.get("name")
+                if key in live and z.get("points"):
+                    poly = [((p.get("x"), p.get("y")) if isinstance(p, dict) else (p[0], p[1]))
+                            for p in z["points"]]
+                    cells_by_key[key] = cells_for_points(xy, poly)
+            if cells_by_key:
+                self._zone_coverage.update_live(cells_by_key)
+
+        self._state["zone_last_mowed"] = self._zone_coverage.last_mowed_map()
+        # Rebuild the (heavier) mask render only while something is actively changing.
+        if live or "zone_coverage_history" not in self._state:
+            self._state["zone_coverage_history"] = self._zone_coverage.render_masks()
+        # Checkpoint debounced (Store.async_save is non-blocking).
+        self._zonecov_save_counter += 1
+        if live and self._zonecov_save_counter % 12 == 0:
+            self.hass.async_create_task(
+                self._zonecov_store.async_save(self._zone_coverage.to_dict()))
+
+    def _reconcile_zone_coverage_map(self) -> None:
+        """#4: align persistent masks to an AUTHORITATIVE full zone catalog — drop masks
+        for zones removed from the map, and invalidate masks captured against a different
+        RTK base (their world coords no longer line up). Call ONLY from the catalog parse."""
+        zones = (self._state.get("btMap") or {}).get("zones") or []
+        if not zones:
+            return
+        self._zone_coverage.invalidate_on_base_change(self._state.get("enu_base_point"))
+        self._zone_coverage.drop_zones(
+            {(z.get("hashId") or z.get("name")) for z in zones if z.get("points")})
+        self._state["zone_last_mowed"] = self._zone_coverage.last_mowed_map()
+        self._state["zone_coverage_history"] = self._zone_coverage.render_masks()
+
+    def _snapshot_report_zones(self, zone_ids: list, completed: bool, ts: float) -> None:
+        """#4: authoritative per-zone mask capture at cleanReport. For each zone in the
+        report, rebuild its mask from the final breadcrumb trail — but only OVERWRITE when
+        the zone was substantially covered (≥10% of area), so a cancel/transit doesn't wipe
+        a good prior mask. Stamp last_mowed only on genuine completion."""
+        if not zone_ids:
+            return
+        zones = (self._state.get("btMap") or {}).get("zones") or []
+        if not zones:
+            return
+        xy = [(p["x"], p["y"]) for p in (self._state.get("breadcrumb_track") or [])
+              if isinstance(p, dict) and "x" in p and "y" in p]
+        enu_base = self._state.get("enu_base_point")
+        byid = {(z.get("hashId") or z.get("name")): z for z in zones if z.get("points")}
+        cell2 = self._zone_coverage.cell_m ** 2
+        completed_keys = []
+        for zid in zone_ids:
+            z = byid.get(zid)
+            if not z:
+                continue
+            key = z.get("hashId") or z.get("name")
+            poly = [((p.get("x"), p.get("y")) if isinstance(p, dict) else (p[0], p[1]))
+                    for p in z["points"]]
+            cells = cells_for_points(xy, poly)
+            area = polygon_area(poly)
+            if area > 0 and len(cells) * cell2 >= 0.10 * area:
+                # note_active is a no-op if the live path already cleared it this session;
+                # update_live then writes the final mask either way.
+                self._zone_coverage.note_active(key, z.get("name"), self._mow_session_key, enu_base)
+                self._zone_coverage.update_live({key: cells})
+            if completed:
+                completed_keys.append(key)
+        if completed_keys:
+            self._zone_coverage.mark_completed(completed_keys, ts)
+        self._state["zone_last_mowed"] = self._zone_coverage.last_mowed_map()
+        self._state["zone_coverage_history"] = self._zone_coverage.render_masks()
+        self.hass.async_create_task(
+            self._zonecov_store.async_save(self._zone_coverage.to_dict()))
 
     def _flaggable_zones(self, zones, zone_stats):
         """Zones eligible for flagging (obstacles / missed / single-pass / red background).
@@ -1983,7 +2237,20 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         try:
             _LOGGER.info("Refreshing AWS credentials for %s", self.thing_name)
-            await self.auth.ensure_valid(self._email, self._password)
+            try:
+                await self.auth.ensure_valid(self._email, self._password)
+            except LymowError as auth_err:
+                # Token refresh hard-failed mid-run (refresh token expired/revoked) and
+                # there's no stored password to recover with → escalate to HA's reauth
+                # flow now, instead of leaving the user stale until the next restart.
+                # async_start_reauth is idempotent (HA won't open duplicate flows).
+                if self._config_entry and not (self._email and self._password):
+                    _LOGGER.warning(
+                        "Token refresh failed for %s — starting re-authentication", self.thing_name
+                    )
+                    self._config_entry.async_start_reauth(self.hass)
+                    return
+                raise
             await self._connect_mqtt()
             _LOGGER.info("MQTT reconnected for %s", self.thing_name)
         except Exception:
@@ -2425,6 +2692,14 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._wait_state_update(timeout=3.0)
         return ok
 
+    async def async_play_sound(self, audio_id: int) -> bool:
+        """Play a built-in voice prompt on the mower by AudioId (PbInput.audioId) — the
+        locate / find-my-mower trigger. Fire-and-forget: the mower plays the prompt but does
+        NOT echo a commanded id back in telemetry, so there's no state feedback (confirmed live
+        2026-06-22). Shared by the Play Sound select + the lymow.play_sound service."""
+        from .protocol import encode_play_audio
+        return bool(self._publish(encode_play_audio(int(audio_id))))
+
     async def async_set_dock_on_error(self, enabled: bool) -> bool:
         """Set whether the mower returns to dock on error."""
         from .protocol import encode_set_dock_on_error
@@ -2577,6 +2852,28 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         affects current-channel derivation. Pushes an update so the next derive
         and the number entity both see it."""
         self._state["channel_buffer_m"] = max(0.0, float(value))
+        self.async_set_updated_data(self._state)
+
+    def set_mow_interval_days(self, value: float) -> None:
+        """Local-only setting (#2): how often each zone should be mowed. Drives the
+        mow-age colour ramp + the Overdue Zones sensor. Persisted with the coverage
+        masks so it survives restarts. Not sent to the device."""
+        v = max(1.0, float(value))
+        self._zone_coverage.mow_interval_days = v
+        self._state["mow_interval_days"] = v
+        self.hass.async_create_task(
+            self._zonecov_store.async_save(self._zone_coverage.to_dict()))
+        self.async_set_updated_data(self._state)
+
+    def set_dim_by_age(self, on: bool) -> None:
+        """Local-only setting (#2): when ON, dim the stripe coverage styles (Green Checker /
+        Logical Passes / Gradient / Activity) per zone by mow-age — older zones go darker/
+        duller while the stripes stay visible. Persisted with the coverage masks; not sent
+        to the device."""
+        self._zone_coverage.dim_by_age = bool(on)
+        self._state["dim_by_age"] = bool(on)
+        self.hass.async_create_task(
+            self._zonecov_store.async_save(self._zone_coverage.to_dict()))
         self.async_set_updated_data(self._state)
 
 

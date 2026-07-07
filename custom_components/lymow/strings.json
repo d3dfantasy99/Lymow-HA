@@ -39,7 +39,8 @@
     },
     "abort": {
       "already_configured": "This robot is already configured",
-      "no_devices": "No robots found on this account"
+      "no_devices": "No robots found on this account",
+      "reauth_successful": "Re-authentication successful — Lymow is reconnected"
     }
   },
   "options": {
@@ -47,7 +48,8 @@
       "init": {
         "title": "Lymow Options",
         "data": {
-          "scan_interval": "Poll interval (seconds, 10–300)"
+          "scan_interval": "Poll interval (seconds, 10–300)",
+          "render_multiprocessing": "Render map in a separate process (recommended for large lawns)"
         }
       }
     }

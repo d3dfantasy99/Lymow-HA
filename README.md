@@ -204,6 +204,18 @@ service: lymow.cancel_task
 
 ---
 
+## Coverage & mow history
+
+Per-zone coverage and last-mowed times **persist across restarts and new mows** — they're
+saved to the integration's config entry, not just held in memory. Each zone keeps its mowed
+footprint on the map, tinted by **mow-age** (brighter = mowed more recently, fading as it
+ages past your **Mow Interval**), and the **Overdue Zones** / **Zone Age** sensors track how
+long it's been since each zone was last cut. A zone you mowed last week still shows its
+coverage today, and starting a fresh task only clears the zone(s) actually being mowed — so a
+partial mow never wipes the rest of the map.
+
+---
+
 ## Session history automations
 
 The `event.lymow_<<mowername>>_last_session` entity fires whenever a new completed session is detected. Use it to send a notification when mowing finishes:
@@ -252,6 +264,57 @@ entities:
       color: "#ff6f00"
       fill_opacity: 0
 ```
+
+---
+
+## Example automations
+
+### Alert if the mower leaves its mapped area
+
+The **Location State** sensor (`sensor.lymow_<<mowername>>_location_state`) reads `Docked`,
+`Zone: <name>`, `Channel: <label>`, `No Go: <name>`, or `Off-Map`. `No Go:` and `Off-Map` are
+geofence breaches (also exposed via the `is_breach` attribute), so you can notify or alarm the
+moment the mower goes where it shouldn't:
+
+```yaml
+automation:
+  - alias: "Lymow left its mapped area"
+    trigger:
+      - platform: state
+        entity_id: sensor.lymow_<<mowername>>_location_state
+        to: "Off-Map"
+        for: "00:00:30"            # debounce brief GPS wobble
+    action:
+      - service: notify.notify
+        data:
+          message: "⚠️ Lymow is outside its mapped area (possible theft, or stuck off-map)."
+```
+
+### Sound the theft alarm if it leaves the yard
+
+Combine the Location State sensor with the mower's built-in audio — play its **Theft Alarm**
+clip when it goes Off-Map:
+
+```yaml
+automation:
+  - alias: "Lymow theft alarm"
+    trigger:
+      - platform: state
+        entity_id: sensor.lymow_<<mowername>>_location_state
+        to: "Off-Map"
+        for: "00:00:30"
+    action:
+      - service: lymow.play_sound
+        data:
+          audio_id: 31              # 31 = Theft Alarm
+```
+
+### Playing sounds
+
+Use the **Play Sound** select (pick a clip; it auto-resets to `None`) or call the
+`lymow.play_sound` service with `audio_id` — these are the mower's own **built-in audio
+clips** (e.g. `30` Stop Button Pressed, `31` Theft Alarm, `32` Cutting Started), not custom
+tones. Fire-and-forget: the mower has no audio feedback, so the select snaps back after firing.
 
 ---
 

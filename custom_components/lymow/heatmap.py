@@ -126,9 +126,12 @@ def render_heatmap(breadcrumbs, key, bad, good, sx, sy, size, scale, style):
             t = tval(m)
             if style == "Contour":
                 t = round(t * 5) / 5
-            px, py = sx(cx * CELL), sy(cy * CELL); s = cw * 0.7
+            px, py = sx(cx * CELL), sy(cy * CELL); s = cw * 0.85
             od.rectangle((px - s, py - s, px + s, py + s), fill=_ramp(t) + (220,))
-        ov = ov.filter(ImageFilter.GaussianBlur(9 if style == "Smooth" else 3))
+        # Blur scaled to the cell pixel size so it's actually smooth at ANY resolution — the
+        # old fixed 9px blur barely softened the big cells at high res (looked blocky). [Nate]
+        _blur = (cw * 0.6) if style == "Smooth" else (cw * 0.18)
+        ov = ov.filter(ImageFilter.GaussianBlur(max(2.0, _blur)))
         img.alpha_composite(ov)
     return img
 

@@ -7,6 +7,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import CognitoAuth, LymowClient
@@ -64,18 +65,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         auth.from_dict(entry.data)
         try:
             await auth.ensure_valid(email or None, password or None)
-        except Exception:
+        except Exception as err:
             if auth_method == AUTH_METHOD_GOOGLE:
-                _LOGGER.error("Google OAuth tokens expired for %s — reconfigure the integration", thing_name)
-                raise
+                # Refresh token expired/revoked — Google users have no stored
+                # credential to silently re-login with. Raise ConfigEntryAuthFailed
+                # so HA starts the reauth flow (re-authenticate in place, keep history).
+                _LOGGER.warning(
+                    "Google OAuth session expired for %s — re-authentication required",
+                    thing_name,
+                )
+                raise ConfigEntryAuthFailed(
+                    "Google OAuth session expired — please re-authenticate"
+                ) from err
             _LOGGER.warning("Stored tokens invalid for %s — re-logging in", thing_name)
+            try:
+                await auth.login(email, password)
+                await auth.get_aws_credentials()
+            except Exception as err2:
+                raise ConfigEntryAuthFailed(
+                    "Lymow login failed — please re-authenticate"
+                ) from err2
+    elif email and password:
+        try:
             await auth.login(email, password)
             await auth.get_aws_credentials()
-    elif email and password:
-        await auth.login(email, password)
-        await auth.get_aws_credentials()
+        except Exception as err:
+            raise ConfigEntryAuthFailed(
+                "Lymow login failed — please re-authenticate"
+            ) from err
     else:
-        raise Exception("No credentials available — reconfigure the integration")
+        raise ConfigEntryAuthFailed(
+            "No stored credentials — please re-authenticate"
+        )
 
     client = LymowClient(region, auth, session)
 

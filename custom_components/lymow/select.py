@@ -12,6 +12,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+    AUDIO_LABEL_TO_ID,
+    AUDIO_PLAY_OPTIONS,
     CLEAN_MODE_OPTIONS,
     COVERAGE_STYLE_DEFAULT,
     COVERAGE_STYLE_OPTIONS,
@@ -50,7 +52,34 @@ async def async_setup_entry(
         LymowMapLabelsSelect(coord),
         LymowMapResolutionSelect(coord),
         LymowMowerSizeSelect(coord),
+        LymowPlaySoundSelect(coord),
     ], update_before_add=False)
+
+
+class LymowPlaySoundSelect(LymowEntity, SelectEntity):
+    """Manually play one of the mower's built-in voice prompts (locate / find-my-mower).
+
+    Momentary action menu: pick a prompt → it plays → the select snaps back to "None". For
+    automations and custom Lovelace buttons, call the `lymow.play_sound` service with audio_id
+    instead — that's the one-shot primitive; this select is the point-and-play manual UI.
+    The prompts are spoken sentences (the mower's own voice vocabulary), not tones; the mower
+    plays on command but gives NO state feedback (fire-and-forget)."""
+
+    _attr_name = "Play Sound"
+    _attr_icon = "mdi:bullhorn"
+    _attr_options = AUDIO_PLAY_OPTIONS
+    _attr_current_option = "None"
+    _attr_extra_state_attributes = {"description": "Manually play one of the mower's built-in voice prompts (find-my-mower / locate). Pick a prompt to play it; the select then resets to 'None'. Fire-and-forget — the mower has no audio feedback. For automations or single-tap Lovelace buttons, call the lymow.play_sound service with audio_id (0-33) instead."}
+
+    def __init__(self, coordinator: LymowCoordinator) -> None:
+        super().__init__(coordinator, "play_sound_select")
+
+    async def async_select_option(self, option: str) -> None:
+        aid = AUDIO_LABEL_TO_ID.get(option)
+        if aid is not None:                       # skip "None" (idle/reset)
+            await self.coordinator.async_play_sound(aid)
+        self._attr_current_option = "None"        # momentary — return to idle
+        self.async_write_ha_state()
 
 
 class LymowMowerSizeSelect(LymowEntity, SelectEntity):

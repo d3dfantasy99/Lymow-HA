@@ -447,6 +447,20 @@ AUDIO_EVENT_TYPES: list[str] = [
     audio_event_type(c) for c in AUDIO_ID_LABELS if c not in (0, 33)
 ]
 
+# "Play Sound" select: a manual locate / find-my-mower trigger. "None" is the idle/reset
+# state — picking a prompt plays it then the select snaps back to "None". Excludes the 0/33
+# sentinels. (For automations / custom Lovelace buttons, call the lymow.play_sound service
+# with audio_id directly — that's the clean one-shot primitive; this select is the manual UI.)
+# Excluded from PLAY: 0/33 sentinels, and 2 "Power Off" (doesn't play a usable prompt /
+# risks a shutdown — confirmed live 2026-06-22; kept in AUDIO_ID_LABELS for DECODING only).
+_AUDIO_PLAY_SKIP = (0, 2, 33)
+AUDIO_PLAY_OPTIONS: list[str] = ["None"] + [
+    AUDIO_ID_LABELS[c] for c in AUDIO_ID_LABELS if c not in _AUDIO_PLAY_SKIP
+]
+AUDIO_LABEL_TO_ID: dict[str, int] = {
+    AUDIO_ID_LABELS[c]: c for c in AUDIO_ID_LABELS if c not in _AUDIO_PLAY_SKIP
+}
+
 # ─────────────────────────────────────────────────────────────
 # (Push-notification event feature removed: mobilePushNotification codes were never
 # reverse-engineered and the feature went unused.)
@@ -488,8 +502,13 @@ RTSP_PATH = "h264ESVideoTest"
 # Still user-tunable via the Channel Detection Buffer number for extra GPS slack if needed.
 DEFAULT_CHANNEL_BUFFER_M = 0.0
 
+# "Mow this often" (days) — drives the mow-age colour ramp + the Overdue Zones sensor (#2).
+DEFAULT_MOW_INTERVAL_DAYS = 7.0
+
 # Coverage map render styles (UI preference, persisted via sticky_device_info).
-COVERAGE_STYLE_OPTIONS = ["Gradient", "Logical Passes", "Green Checker", "Activity", "Paths Off"]
+# "Zone Age" tints each zone green by how long since its last completed mow (darker =
+# older), with the age folded into the zone label — an at-a-glance "what's overdue" view.
+COVERAGE_STYLE_OPTIONS = ["Gradient", "Logical Passes", "Green Checker", "Activity", "Zone Age", "Paths Off"]
 COVERAGE_STYLE_DEFAULT = "Green Checker"
 
 # Map name labels (UI preference, persisted via sticky_device_info). Controls which
