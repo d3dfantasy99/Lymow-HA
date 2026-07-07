@@ -7,23 +7,26 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import multiprocessing
 import os
 import shutil
 import tempfile
 import threading
+from concurrent.futures import ProcessPoolExecutor
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from typing import Any
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant, Event, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 
 from .const import DOMAIN, F_IP_ADDRESS, F_NET_DETAIL, RTSP_PATH, RTSP_PORT
 from .coordinator import LymowCoordinator
 from .entity_base import LymowEntity
-from .map_render import build_map_png, png_bytes, text_png, safe_points, Image, _PIL_ERROR
+from .map_render import build_map_png, text_png, safe_points, Image, _PIL_ERROR
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,7 +52,7 @@ async def async_setup_entry(
 ) -> None:
     coord: LymowCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        [LymowMapCamera(coord), LymowRTSPCamera(coord)],
+        [LymowMapCamera(coord, entry), LymowRTSPCamera(coord)],
         update_before_add=False,
     )
 
@@ -62,7 +65,7 @@ class LymowMapCamera(LymowEntity, Camera):
     _attr_content_type = "image/png"
     _attr_supported_features = CameraEntityFeature(0)
 
-    def __init__(self, coordinator: LymowCoordinator) -> None:
+    def __init__(self, coordinator: LymowCoordinator, entry: ConfigEntry) -> None:
         LymowEntity.__init__(self, coordinator, "map")
         Camera.__init__(self)
         self._render_error: str | None = None
@@ -73,10 +76,35 @@ class LymowMapCamera(LymowEntity, Camera):
         # ONE map at a time; concurrent callers get the last finished frame. [xar]
         self._render_lock = threading.Lock()
         self._render_last_img: bytes | None = None
+        # Optionally run the GIL-bound map render in a separate process so the heavy
+        # coverage math never blocks HA's event loop. [xar]
+        self._multiprocessing = entry.options.get("render_multiprocessing", True)
+        self._executor: ProcessPoolExecutor | None = None
 
     @property
     def available(self) -> bool:
         return self.coordinator.last_update_success
+
+    # ── lifecycle ────────────────────────────────────────────────
+
+    @callback
+    def _on_hass_stop(self, event: Event) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._multiprocessing and self._executor is None:
+            # spawn (not fork) — fork is unsafe alongside asyncio/threads. One worker
+            # is enough; the render single-flight lock already serializes calls.
+            self._executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+            self.async_on_remove(self._executor.shutdown)
+            self.async_on_remove(
+                self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._on_hass_stop)
+            )
 
     # ── sync render (always called in executor) ──────────────────
 
@@ -95,10 +123,23 @@ class LymowMapCamera(LymowEntity, Camera):
                     or (self.coordinator.data or {}).get("deviceName")
                     or "Lymow"
                 )
-                img, dbg = build_map_png(self.coordinator.data or {}, imperial=imperial, device_name=name)
+                coord_data = self.coordinator.data or {}
+                if self._multiprocessing and self._executor is not None:
+                    # Heavy coverage math is GIL-bound pure Python → run it in a separate
+                    # process so HA's event loop stays responsive. Pass only builtin-typed
+                    # top-level values: drops un-picklable protobuf objects; the coverage
+                    # masks are plain dict/list so they survive. [xar]
+                    render_data = {
+                        k: v for k, v in coord_data.items()
+                        if type(v).__module__ == "builtins"
+                    }
+                    data, dbg = self._executor.submit(
+                        build_map_png, render_data, imperial=imperial, device_name=name
+                    ).result()
+                else:
+                    data, dbg = build_map_png(coord_data, imperial=imperial, device_name=name)
                 self._render_debug = dbg
                 self._render_error = None
-                data = png_bytes(img)
             except Exception as exc:
                 self._render_error = f"{type(exc).__name__}: {exc}"
                 _LOGGER.exception("Lymow diagnostic map render failed")
