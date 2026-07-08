@@ -492,7 +492,7 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 pass
             self.mqtt = None
 
-        self.mqtt = MqttClient(
+        cli = MqttClient(
             thing_name=self.thing_name,
             host=self.client._ep["iotDomain"].replace("https://", "").rstrip("/"),
             region=self._region,
@@ -500,11 +500,12 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             on_notify_app=self._handle_notify_app,
             on_disconnect_cb=self._handle_disconnect,
         )
-        await self.mqtt.connect(
+        await cli.connect(
             access_key=self.auth.access_key_id,
             secret_key=self.auth.secret_access_key,
             session_token=self.auth.session_token,
         )
+        self.mqtt = cli
         _LOGGER.debug("MQTT connected for %s — firing startup queries", self.thing_name)
         self._fire_startup_queries()
 
@@ -2231,30 +2232,41 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
     async def _reconnect_with_fresh_creds(self) -> None:
-        """Refresh AWS credentials and re-create the MQTT connection."""
-        await asyncio.sleep(_RECONNECT_DELAY)
-        if self._shutting_down:
-            return
-        try:
-            _LOGGER.info("Refreshing AWS credentials for %s", self.thing_name)
+        """Refresh AWS credentials and re-create the MQTT connection, retrying with backoff."""
+        attempt = 0
+        while not self._shutting_down:
+            delay = min(_RECONNECT_DELAY * (2 ** attempt), 300)
+            _LOGGER.debug(
+                "MQTT reconnect attempt %d for %s — waiting %ds",
+                attempt + 1, self.thing_name, delay,
+            )
+            await asyncio.sleep(delay)
+            if self._shutting_down:
+                return
             try:
-                await self.auth.ensure_valid(self._email, self._password)
-            except LymowError as auth_err:
-                # Token refresh hard-failed mid-run (refresh token expired/revoked) and
-                # there's no stored password to recover with → escalate to HA's reauth
-                # flow now, instead of leaving the user stale until the next restart.
-                # async_start_reauth is idempotent (HA won't open duplicate flows).
-                if self._config_entry and not (self._email and self._password):
-                    _LOGGER.warning(
-                        "Token refresh failed for %s — starting re-authentication", self.thing_name
-                    )
-                    self._config_entry.async_start_reauth(self.hass)
-                    return
-                raise
-            await self._connect_mqtt()
-            _LOGGER.info("MQTT reconnected for %s", self.thing_name)
-        except Exception:
-            _LOGGER.exception("MQTT reconnect failed for %s — will retry on next disconnect", self.thing_name)
+                _LOGGER.info("Refreshing AWS credentials for %s (attempt %d)", self.thing_name, attempt + 1)
+                try:
+                    await self.auth.ensure_valid(self._email, self._password)
+                except LymowError:
+                    # Token refresh hard-failed (refresh token expired/revoked) with no stored
+                    # password to recover with → escalate to HA's reauth flow instead of
+                    # retrying forever. async_start_reauth is idempotent (no duplicate flows).
+                    if self._config_entry and not (self._email and self._password):
+                        _LOGGER.warning(
+                            "Token refresh failed for %s — starting re-authentication", self.thing_name
+                        )
+                        self._config_entry.async_start_reauth(self.hass)
+                        return
+                    raise
+                await self._connect_mqtt()
+                _LOGGER.info("MQTT reconnected for %s", self.thing_name)
+                return
+            except Exception:
+                attempt += 1
+                _LOGGER.warning(
+                    "MQTT reconnect attempt %d failed for %s — will retry in %ds",
+                    attempt, self.thing_name, min(_RECONNECT_DELAY * (2 ** attempt), 300),
+                )
 
     # ── Background loops ─────────────────────────────────────────
 
