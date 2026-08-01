@@ -9,6 +9,7 @@ __init__.py via _register_services().
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from homeassistant.components.lawn_mower import (
     LawnMowerActivity,
@@ -73,6 +74,15 @@ class LymowMower(LymowEntity, LawnMowerEntity):
     @property
     def supported_features(self) -> LawnMowerEntityFeature:
         return state_matrix.features_for(self._row())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        d = self.coordinator.data or {}
+        attrs: dict[str, Any] = {}
+        for key in ("cleanZoneIds", "cleanPercent", "isRecharging", "mapArea", "areaOrGlobal"):
+            if key in d:
+                attrs[key] = list(d[key]) if key == "cleanZoneIds" else d[key]
+        return attrs
 
     # ── commands ──────────────────────────────────────────────────────────
 
