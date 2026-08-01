@@ -2421,6 +2421,8 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.auth.ensure_valid(self._email, self._password)
         await self._preflight_query_map()
         if zone_ids:
+            # Clear stale mowed-area coverage from a previous session before starting
+            self._state.pop("mowed_area_polygons", None)
             raw = encode_start_zones(zone_ids)
         else:
             row = self._state_row()

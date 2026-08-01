@@ -199,7 +199,9 @@ def _register_services(hass: HomeAssistant) -> None:
  
         if not resolved:
             raise HomeAssistantError("No valid zones provided.")
- 
+
+        # Clear stale mowed-area coverage from a previous session before starting
+        coord._state.pop("mowed_area_polygons", None)
         coord._publish(encode_start_zones(resolved))
  
     async def _handle_dock_cancel_task(call: ServiceCall) -> None:
