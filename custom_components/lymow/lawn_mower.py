@@ -9,6 +9,7 @@ __init__.py via _register_services().
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from homeassistant.components.lawn_mower import (
     LawnMowerActivity,
@@ -73,6 +74,26 @@ class LymowMower(LymowEntity, LawnMowerEntity):
     @property
     def supported_features(self) -> LawnMowerEntityFeature:
         return state_matrix.features_for(self._row())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        d = self.coordinator.data or {}
+        attrs: dict[str, Any] = {}
+        # isRecharging -> taskRecharging: the state dict key mirrors the vendor's
+        # raw PbRobotInfo field name, but exposed as-is it reads as "is the mower
+        # charging" (false while plainly charging with no paused task), which is
+        # backwards from what it actually signals: a recharge tied to a paused,
+        # to-be-resumed task.
+        for src, attr in (
+            ("cleanZoneIds", "cleanZoneIds"),
+            ("cleanPercent", "cleanPercent"),
+            ("isRecharging", "taskRecharging"),
+            ("mapArea", "mapArea"),
+            ("areaOrGlobal", "areaOrGlobal"),
+        ):
+            if src in d:
+                attrs[attr] = list(d[src]) if src == "cleanZoneIds" else d[src]
+        return attrs
 
     # ── commands ──────────────────────────────────────────────────────────
 

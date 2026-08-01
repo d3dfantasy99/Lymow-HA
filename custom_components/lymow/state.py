@@ -228,6 +228,8 @@ def merge_pboutput(state: dict[str, Any], msg: Any) -> dict[str, Any]:
             area = ci.areaInfo
             if len(getattr(area, "cleanZoneIds", [])):
                 state["cleanZoneIds"] = list(area.cleanZoneIds)
+            if _has_field(area, "areaOrGlobal"):
+                state["areaOrGlobal"] = area.areaOrGlobal
 
     pose = getattr(msg, "pose", None)
     if _has_msg(pose):
