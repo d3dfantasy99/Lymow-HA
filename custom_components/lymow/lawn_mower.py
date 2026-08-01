@@ -79,9 +79,20 @@ class LymowMower(LymowEntity, LawnMowerEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         d = self.coordinator.data or {}
         attrs: dict[str, Any] = {}
-        for key in ("cleanZoneIds", "cleanPercent", "isRecharging", "mapArea", "areaOrGlobal"):
-            if key in d:
-                attrs[key] = list(d[key]) if key == "cleanZoneIds" else d[key]
+        # isRecharging -> taskRecharging: the state dict key mirrors the vendor's
+        # raw PbRobotInfo field name, but exposed as-is it reads as "is the mower
+        # charging" (false while plainly charging with no paused task), which is
+        # backwards from what it actually signals: a recharge tied to a paused,
+        # to-be-resumed task.
+        for src, attr in (
+            ("cleanZoneIds", "cleanZoneIds"),
+            ("cleanPercent", "cleanPercent"),
+            ("isRecharging", "taskRecharging"),
+            ("mapArea", "mapArea"),
+            ("areaOrGlobal", "areaOrGlobal"),
+        ):
+            if src in d:
+                attrs[attr] = list(d[src]) if src == "cleanZoneIds" else d[src]
         return attrs
 
     # ── commands ──────────────────────────────────────────────────────────
