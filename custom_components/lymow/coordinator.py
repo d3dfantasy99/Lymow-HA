@@ -118,7 +118,12 @@ from .map_tuning import (
     DWELL_SPIN_TURNS, DWELL_JITTER_PATH_M, DWELL_STRUGGLE_PATH_M,
 )
 from .state_matrix import lookup as lookup_state_row
-from .path_engine import classify_segments, CutAccumulator, BreadcrumbAccumulator
+from .path_engine import (
+    accumulate_mowed_area_polygons,
+    classify_segments,
+    CutAccumulator,
+    BreadcrumbAccumulator,
+)
 from .obstacles import detect_obstacles
 from .pass_coverage import analyze_pass_coverage
 from .zone_stats import assign_to_zones, point_in_polygon
@@ -936,12 +941,13 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                         # I marker 333/444 vengono già rimossi da parse_query_path().
                         # Ogni segmento valido con almeno 3 punti può essere disegnato come poligono.
-                        mowed_polygons = [
-                            seg for seg in segments
-                            if isinstance(seg, list) and len(seg) >= 3
-                        ]
-
-                        self._state["mowed_area_polygons"] = mowed_polygons
+                        # Each QUERY_PATH pull only reports segments live in that message, not
+                        # the full session history, so accumulate across pulls rather than
+                        # replacing -- otherwise geojson_mowed_area only ever reflects the
+                        # latest poll instead of everything mowed so far this session.
+                        self._state["mowed_area_polygons"] = accumulate_mowed_area_polygons(
+                            self._state.get("mowed_area_polygons"), segments
+                        )
 
                         # Delete old path
                         self._state.pop("planned_path", None)
@@ -1117,9 +1123,10 @@ class LymowCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                                   self.thing_name, exc_info=True)
 
                         _LOGGER.debug(
-                            "Parsed Lymow QUERY_PATH as mowed area for %s: polygons=%s points=%s markers=%s",
+                            "Parsed Lymow QUERY_PATH as mowed area for %s: "
+                            "total_polygons=%s points=%s markers=%s",
                             self.thing_name,
-                            len(mowed_polygons),
+                            len(self._state["mowed_area_polygons"]),
                             path.get("points_count"),
                             path.get("marker_count"),
                         )

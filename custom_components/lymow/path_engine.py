@@ -184,6 +184,22 @@ def classify_segments(
     return cut, planned, large_fps, accumulate
 
 
+def accumulate_mowed_area_polygons(existing: list, segments: list) -> list:
+    """Merge one QUERY_PATH pull's drawable segments onto the running mowed-area
+    polygon set for the session, instead of replacing it.
+
+    Each pull only reports the segments live in that message, not the full
+    session history, so the caller must carry `existing` forward pull-to-pull
+    (reset it at session start). Overlapping polygons are not deduped here --
+    visually they just harmlessly union.
+    """
+    new_polygons = [
+        seg for seg in (segments or [])
+        if isinstance(seg, list) and len(seg) >= 3
+    ]
+    return list(existing or []) + new_polygons
+
+
 class CutAccumulator:
     """Stitches the per-pull CUT segment into a full session actual-path track.
 
