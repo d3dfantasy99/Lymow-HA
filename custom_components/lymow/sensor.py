@@ -137,7 +137,7 @@ def _zone_catalog_value(key: str) -> Callable[[dict], Any]:
         if key == "channel_count":
             return len(btmap.get("channels") or [])
         if key == "zones_with_points":
-            return sum(1 for z in (btmap.get("zones") or []) if z.get("points"))
+            return sum(1 for z in (btmap.get("zones") or []) if isinstance(z, dict) and z.get("points"))
         if key == "has_enu_base_point":
             return bool(btmap.get("enuBasePoint") or d.get("enu_base_point"))
         return btmap.get(key)
@@ -874,7 +874,7 @@ class LymowMapGeoJsonSensor(LymowEntity, SensorEntity):
     def native_value(self) -> str:
         btmap = (self.coordinator.data or {}).get("btMap") or {}
         zones = btmap.get("zones") or []
-        drawable = sum(1 for z in zones if z.get("points") and len(z.get("points") or []) >= 3)
+        drawable = sum(1 for z in zones if isinstance(z, dict) and z.get("points") and len(z.get("points") or []) >= 3)
         return f"{drawable} zones"
 
     @property
