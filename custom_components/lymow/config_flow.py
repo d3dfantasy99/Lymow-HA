@@ -6,6 +6,7 @@ import base64
 import hashlib
 import logging
 import secrets
+import time
 from typing import Any
 
 import aiohttp
@@ -31,6 +32,21 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 OAUTH_CALLBACK_PATH = "/api/lymow/oauth/callback"
+
+# Key under hass.data holding pending OAuth-start tokens. Each entry maps a
+# short, random, single-use token (known only to the authenticated HA user
+# who opened the config flow) to the state/PKCE values *we* generated for
+# that session. The unauthenticated /oauth/start HTTP view resolves a token
+# to these values instead of trusting state/code_challenge from the request
+# query string — see LymowOAuthStartView for why that distinction matters.
+_OAUTH_PENDING_KEY = f"{DOMAIN}_oauth_pending"
+_OAUTH_TOKEN_TTL = 600  # seconds
+
+
+def _prune_expired_oauth_tokens(pending: dict) -> None:
+    now = time.monotonic()
+    for token in [t for t, v in pending.items() if v["expires"] < now]:
+        pending.pop(token, None)
 
 
 class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -201,13 +217,26 @@ class LymowConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         code_challenge = base64.urlsafe_b64encode(
             hashlib.sha256(self._pkce_verifier.encode()).digest()
         ).rstrip(b"=").decode()
-        base = self.hass.config.internal_url or "http://homeassistant.local:8123"
-        import urllib.parse
-        qs = urllib.parse.urlencode({
+
+        # Store state/code_challenge server-side, keyed by a random token,
+        # rather than putting them in the URL query string. Only an
+        # authenticated HA user running this config flow can create one of
+        # these tokens, so a link crafted by a third party with their own
+        # state/code_challenge can no longer be used to phish a victim into
+        # completing a login the attacker could then redeem themselves.
+        pending = self.hass.data.setdefault(_OAUTH_PENDING_KEY, {})
+        _prune_expired_oauth_tokens(pending)
+        token = secrets.token_urlsafe(24)
+        pending[token] = {
             "region": self._region,
             "state": self._oauth_state,
-            "cc": code_challenge,
-        })
+            "code_challenge": code_challenge,
+            "expires": time.monotonic() + _OAUTH_TOKEN_TTL,
+        }
+
+        base = self.hass.config.internal_url or "http://homeassistant.local:8123"
+        import urllib.parse
+        qs = urllib.parse.urlencode({"token": token})
         return f"{base}/api/lymow/oauth/start?{qs}"
 
     def _oauth_redirect_uri(self) -> str:
@@ -272,7 +301,19 @@ class LymowOptionsFlow(config_entries.OptionsFlow):
 
 
 class LymowOAuthStartView(HomeAssistantView):
-    """Intercept the myapp:// redirect and display the code."""
+    """Show the Google sign-in link for a pending Lymow config-flow session.
+
+    SECURITY NOTE: this view is unauthenticated (requires_auth = False) so
+    that clicking the link from the config-flow form works without a second
+    HA login prompt. It must never build the authorize URL from state /
+    code_challenge values supplied directly in the request — that would let
+    anyone (no HA login required) craft a link with their own PKCE
+    code_challenge, send it to a victim, and redeem the resulting
+    authorization code themselves once the victim completes the Google
+    login on what looks like their own trusted HA instance. Instead we only
+    accept an opaque, single-use `token` and look up the state/challenge
+    *we* generated when the authenticated user opened the config flow.
+    """
 
     url = "/api/lymow/oauth/start"
     name = "api:lymow:oauth:start"
@@ -281,19 +322,35 @@ class LymowOAuthStartView(HomeAssistantView):
     async def get(self, request):
         from aiohttp import web
         import html as html_mod
-        region = request.query.get("region", "us-east-2")
+        import time as time_mod
+
+        hass = request.app["hass"]
+        pending = hass.data.get(_OAUTH_PENDING_KEY, {})
+        token = request.query.get("token", "")
+        entry = pending.get(token)
+
+        if not entry or entry["expires"] < time_mod.monotonic():
+            pending.pop(token, None)
+            return web.Response(
+                text="This link has expired or is invalid. Go back to Home "
+                     "Assistant and restart the Lymow Google sign-in step.",
+                status=400,
+            )
+
+        # Single-use: remove so the token/link can't be replayed later.
+        pending.pop(token, None)
+
+        region = entry["region"]
         if region not in REGIONS:
             return web.Response(text="Invalid region", status=400)
-        state = request.query.get("state", "")
-        code_challenge = request.query.get("cc", "")
-        hass = request.app["hass"]
+
         session = async_get_clientsession(hass)
         auth = CognitoAuth(region, session)
         auth_url = auth.get_oauth_authorize_url(
             redirect_uri="myapp://callback/",
             provider="Google",
-            state=state or None,
-            code_challenge=code_challenge or None,
+            state=entry["state"],
+            code_challenge=entry["code_challenge"],
         )
         safe_url = html_mod.escape(auth_url)
         page = f"""<!DOCTYPE html><html><head><title>Lymow - Sign in with Google</title>
