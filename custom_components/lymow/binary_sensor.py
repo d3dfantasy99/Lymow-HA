@@ -35,6 +35,15 @@ class LymowBinDesc(BinarySensorEntityDescription):
     value_fn: Callable[[dict], bool] = lambda d: False
 
 
+def _read(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a key from a dict or protobuf object."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
     LymowBinDesc(
         key="online",
@@ -81,7 +90,7 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         icon="mdi:wifi",
         value_fn=lambda d: bool(d.get(F_WIFI_WORKING))
-            or (d.get("netDetailInfo") or {}).get("currentNet") == 1,
+            or _read(d.get("netDetailInfo"), "currentNet", d.get("currentNet")) == 1,
         entity_registry_enabled_default=False,
     ),
     LymowBinDesc(
@@ -90,7 +99,7 @@ BINARY_SENSORS: tuple[LymowBinDesc, ...] = (
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         icon="mdi:signal-4g",
         value_fn=lambda d: bool(d.get(F_LTE_WORKING))
-            or (d.get("netDetailInfo") or {}).get("currentNet") == 2,
+            or _read(d.get("netDetailInfo"), "currentNet", d.get("currentNet")) == 2,
         entity_registry_enabled_default=False,
     ),
     LymowBinDesc(
