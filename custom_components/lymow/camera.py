@@ -53,9 +53,15 @@ FALLBACK_PNG = (
 
 
 def _get_robot_ip(data: dict) -> str | None:
+    net_detail = data.get(F_NET_DETAIL)
+    wifi_ip = (
+        net_detail.get("wifiIp")
+        if isinstance(net_detail, dict)
+        else getattr(net_detail, "wifiIp", None)
+    )
     return (
         data.get(F_IP_ADDRESS)
-        or (data.get(F_NET_DETAIL) or {}).get("wifiIp")
+        or wifi_ip
         or data.get("rest_ip_address")
     )
 
@@ -295,6 +301,11 @@ class LymowRTSPCamera(LymowEntity, Camera):
             self._proxy_process.pid,
             url,
         )
+
+        if self.stream is not None:
+            self.stream.update_source(
+                f"http://127.0.0.1:{self._hls_port}/stream.m3u8"
+            )
 
     async def _stop_hls_proxy(self) -> None:
         if self._proxy_process:
